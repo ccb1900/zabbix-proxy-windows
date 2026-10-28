@@ -1,0 +1,4 @@
+# Patches and overlay files are applied onto the upstream tree byte for byte.
+# No line-ending conversion here; scripts/prepare.sh renormalises the prepared
+# tree to the platform convention (CRLF on Windows) after applying them.
+* -text

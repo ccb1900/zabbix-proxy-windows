@@ -1,0 +1,9 @@
+0001-build-msvc-makefiles.patch
+0002-platform-headers.patch
+0003-threads-instead-of-fork.patch
+0004-shared-memory-and-locks.patch
+0005-ipc-over-loopback.patch
+0006-icmp-windows-api.patch
+0007-snmp-ssh.patch
+0008-sqlite-wal.patch
+0009-portability-fixes.patch

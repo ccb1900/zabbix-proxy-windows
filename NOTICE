@@ -1,0 +1,14 @@
+Zabbix proxy for Windows, community build
+
+This repository contains modifications to, and additions for, Zabbix
+(https://www.zabbix.com), copyright Zabbix SIA, distributed under the GNU
+Affero General Public License v3 (see LICENSE). The modifications and
+additions in this repository are distributed under the same license.
+
+This project is not affiliated with, endorsed by or supported by Zabbix SIA.
+"Zabbix" is a trademark of Zabbix SIA, used here only to describe the software
+this build is made from.
+
+Binaries published in the releases of this repository statically link
+third-party libraries (OpenSSL, libcurl, PCRE2, libevent, SQLite, zlib,
+libssh2, libxml2, Net-SNMP) under their respective licenses.

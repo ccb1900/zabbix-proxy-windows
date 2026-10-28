@@ -1,0 +1,647 @@
+Shared memory and locks: heap memory and Windows synchronisation
+
+Workers share one address space, so shared segments are plain heap and
+mutexes / rwlocks map onto Windows primitives. Configuration and history
+caches adjusted accordingly.
+
+diff --git a/include/zbxmutexs.h b/include/zbxmutexs.h
+index f16920a7c31d309a98bbf642e5c701b080df324d..8c09c603b43566dbb4141535571b8462b7f17dd5 100644
+--- a/include/zbxmutexs.h
++++ b/include/zbxmutexs.h
+@@ -24,11 +24,80 @@
+ #	define ZBX_MUTEX_LOG		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_LOG")
+ #	define ZBX_MUTEX_PERFSTAT	zbx_mutex_create_per_process_name(L"ZBX_MUTEX_PERFSTAT")
+ 
++/* the caches and buffers the proxy keeps; unlike the enum used elsewhere, a Windows mutex is identified by a name */
++/* scoped to this process */
++#	define ZBX_MUTEX_CACHE			zbx_mutex_create_per_process_name(L"ZBX_MUTEX_CACHE")
++#	define ZBX_MUTEX_TRENDS		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_TRENDS")
++#	define ZBX_MUTEX_CACHE_IDS		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_CACHE_IDS")
++#	define ZBX_MUTEX_SELFMON		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_SELFMON")
++#	define ZBX_MUTEX_VALUECACHE		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_VALUECACHE")
++#	define ZBX_MUTEX_VMWARE		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_VMWARE")
++#	define ZBX_MUTEX_SQLITE3		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_SQLITE3")
++#	define ZBX_MUTEX_PROXY_HISTORY		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_PROXY_HISTORY")
++#	define ZBX_MUTEX_TREND_FUNC		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_TREND_FUNC")
++#	define ZBX_MUTEX_REMOTE_COMMANDS	zbx_mutex_create_per_process_name(L"ZBX_MUTEX_REMOTE_COMMANDS")
++#	define ZBX_MUTEX_PROXY_BUFFER		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_PROXY_BUFFER")
++#	define ZBX_MUTEX_VPS_MONITOR		zbx_mutex_create_per_process_name(L"ZBX_MUTEX_VPS_MONITOR")
++
+ typedef wchar_t * zbx_mutex_name_t;
+ typedef HANDLE zbx_mutex_t;
+ 
+ #	define zbx_mutex_lock(mutex)		__zbx_mutex_lock(__FILE__, __LINE__, mutex)
+ #	define zbx_mutex_unlock(mutex)		__zbx_mutex_unlock(__FILE__, __LINE__, mutex)
++
++/* Read-write locks, which the configuration and value caches of the proxy need. Elsewhere these are process-shared */
++/* pthread locks; here every Zabbix worker is a thread of one process, so a slim reader/writer lock covers the same */
++/* ground. The handle stays a pointer, so ZBX_RWLOCK_NULL keeps meaning "no lock" for the callers that test it. */
++typedef enum
++{
++	ZBX_RWLOCK_CONFIG = 0,
++	ZBX_RWLOCK_CONFIG_HISTORY,
++	ZBX_RWLOCK_VALUECACHE,
++	ZBX_RWLOCK_COUNT,
++}
++zbx_rwlock_name_t;
++
++#	define ZBX_RWLOCK_NULL			NULL
++
++typedef struct zbx_win_rwlock	*zbx_rwlock_t;
++
++#	define zbx_rwlock_wrlock(rwlock)				\
++									\
++	do								\
++	{								\
++		zbx_prof_start(__func__, ZBX_PROF_RWLOCK);		\
++		__zbx_rwlock_wrlock(__FILE__, __LINE__, rwlock);	\
++		zbx_prof_end_wait();					\
++	}								\
++	while (0)
++
++#	define zbx_rwlock_rdlock(rwlock)				\
++									\
++	do								\
++	{								\
++		zbx_prof_start(__func__, ZBX_PROF_RWLOCK);		\
++		__zbx_rwlock_rdlock(__FILE__, __LINE__, rwlock);	\
++		zbx_prof_end_wait();					\
++	}								\
++	while (0)
++
++#	define zbx_rwlock_unlock(rwlock)				\
++									\
++	do								\
++	{								\
++		__zbx_rwlock_unlock(__FILE__, __LINE__, rwlock);	\
++		zbx_prof_end();						\
++	}								\
++	while (0)
++
++void		__zbx_rwlock_wrlock(const char *filename, int line, zbx_rwlock_t rwlock);
++void		__zbx_rwlock_rdlock(const char *filename, int line, zbx_rwlock_t rwlock);
++void		__zbx_rwlock_unlock(const char *filename, int line, zbx_rwlock_t rwlock);
++void		zbx_rwlock_destroy(zbx_rwlock_t *rwlock);
++int		zbx_rwlock_create(zbx_rwlock_t *rwlock, zbx_rwlock_name_t name, char **error);
++zbx_rwlock_t	zbx_rwlock_addr_get(zbx_rwlock_name_t rwlock_name);
++void		zbx_locks_disable(void);
++void		zbx_locks_enable(void);
+ #else	/* not _WINDOWS */
+ typedef enum
+ {
+diff --git a/src/libs/zbxcacheconfig/dbconfig.c b/src/libs/zbxcacheconfig/dbconfig.c
+index eb55fc0b63c8392b4677a6ce306ef16415119f8d..4a5325a332b150853431e955ee7e2c1fe4bccbe1 100644
+--- a/src/libs/zbxcacheconfig/dbconfig.c
++++ b/src/libs/zbxcacheconfig/dbconfig.c
+@@ -155,7 +155,11 @@ static int	dc_item_ref_compare(const void *d1, const void *d2)
+ 	return 0;
+ }
+ 
+-static int	sync_in_progress = 0;
++/* Set while this worker holds the configuration cache write lock for a sync, and read by the locking macros so that */
++/* the helpers a sync calls do not try to take a lock their caller already holds. It describes the worker, not the */
++/* cache: a worker is a process where this forks and a thread where it does not, and one worker announcing its sync */
++/* must never stop the others from locking halfway through their own critical sections. */
++static ZBX_THREAD_LOCAL int	sync_in_progress = 0;
+ 
+ int	zbx_get_sync_in_progress(void)
+ {
+@@ -233,7 +237,9 @@ void	set_dc_config(zbx_dc_config_t *in)
+ }
+ 
+ static zbx_rwlock_t	config_lock = ZBX_RWLOCK_NULL;
+-static int		wlock_is_locked;
++
++/* Whether this worker holds the write lock, for the same reason and with the same scope as sync_in_progress above. */
++static ZBX_THREAD_LOCAL int	wlock_is_locked;
+ 
+ zbx_rwlock_t	zbx_get_config_lock(void)
+ {
+@@ -369,7 +375,10 @@ struct zbx_dc_um_handle_t
+ 	unsigned char		macro_env;
+ };
+ 
+-static zbx_dc_um_handle_t	*dc_um_handle = NULL;
++/* The open user macro handles form a per-worker stack, and the cache they hold is released when the outermost one */
++/* closes. Workers are threads here, so each needs its own stack: otherwise one worker's close releases a cache */
++/* another worker is still reading through. */
++static ZBX_THREAD_LOCAL zbx_dc_um_handle_t	*dc_um_handle = NULL;
+ 
+ /******************************************************************************
+  *                                                                            *
+@@ -643,7 +652,19 @@ static zbx_uint64_t	get_item_nextcheck_seed(ZBX_DC_ITEM *item, zbx_uint64_t inte
+ 				SUCCEED == cmp_key_id(key, ZBX_SERVER_ICMPPINGLOSS_KEY) ||
+ 				SUCCEED == cmp_key_id(key, ZBX_SERVER_ICMPPINGRETRY_KEY))
+ 		{
++#ifdef _WINDOWS
++			/* On Unix the ICMP items of one interface share a seed so that one fping run covers  */
++			/* the host, and hosts are spread over the interval: an fping run for the one or two  */
++			/* hosts due at each wake-up, each costing (count - 1) * period plus the last wait,   */
++			/* two seconds and more with the defaults, whatever the number of hosts. A few dozen  */
++			/* hosts keep a pinger busy for most of every minute. The Windows build pings a whole */
++			/* batch concurrently through the ICMP driver, so every ICMP item with the same       */
++			/* interval is due at the same second and one call covers all the hosts: the cost of  */
++			/* a minute is that of one run.                                                       */
++			return 0;
++#else
+ 			return interfaceid;
++#endif
+ 		}
+ 	}
+ 
+@@ -1776,9 +1797,10 @@ static void	DCsync_hosts(zbx_dbsync_t *sync, zbx_uint64_t revision, zbx_vector_u
+ #endif
+ 		zbx_vector_ptr_destroy(&host->interfaces_v);
+ 		zbx_hashset_destroy(&host->items);
+-		zbx_hashset_remove_direct(&config->hosts, host);
+-
++		/* host is the hashset entry itself: release what it owns before */
++		/* zbx_hashset_remove_direct() frees it                           */
+ 		zbx_vector_dc_httptest_ptr_destroy(&host->httptests);
++		zbx_hashset_remove_direct(&config->hosts, host);
+ 	}
+ 
+ 	zbx_vector_dc_host_ptr_destroy(&proxy_hosts);
+@@ -16496,8 +16518,8 @@ int	zbx_dc_maintenance_has_tags(void)
+  ******************************************************************************/
+ static zbx_dc_um_handle_t	*dc_open_user_macros(unsigned char macro_env)
+ {
+-	zbx_dc_um_handle_t	*handle;
+-	static zbx_um_cache_t	*um_cache = NULL;
++	zbx_dc_um_handle_t			*handle;
++	static ZBX_THREAD_LOCAL zbx_um_cache_t	*um_cache = NULL;
+ 
+ 	handle = (zbx_dc_um_handle_t *)zbx_malloc(NULL, sizeof(zbx_dc_um_handle_t));
+ 
+diff --git a/src/libs/zbxcacheconfig/proxy_group.c b/src/libs/zbxcacheconfig/proxy_group.c
+index 6822b5f170e82ba4e3922c3faa0256bdc992d5f7..9dbdefe916f465d20a7c30bdd8504aa164ab8745 100644
+--- a/src/libs/zbxcacheconfig/proxy_group.c
++++ b/src/libs/zbxcacheconfig/proxy_group.c
+@@ -323,9 +323,11 @@ void	dc_update_host_proxy(const char *host_old, const char *host_new)
+ 			&hpi_local)))
+ 	{
+ 		dc_strpool_release(hpi->host);
++		/* hpi is the hashset entry: take host_proxy out of it before */
++		/* zbx_hashset_remove_direct() frees it                        */
++		hpi_local.host_proxy = hpi->host_proxy;
+ 		zbx_hashset_remove_direct(&get_dc_config()->host_proxy_index, hpi);
+ 
+-		hpi_local.host_proxy = hpi->host_proxy;
+ 		hpi_local.host = dc_strpool_intern(host_new);
+ 		zbx_hashset_insert(&get_dc_config()->host_proxy_index, &hpi_local, sizeof(hpi_local));
+ 	}
+diff --git a/src/libs/zbxcacheconfig/user_macro.c b/src/libs/zbxcacheconfig/user_macro.c
+index 83ba9b641c9867a4f5409a8969f7645c06c3620c..0ff6ec5f287f7c3499350df49e02b55380b97252 100644
+--- a/src/libs/zbxcacheconfig/user_macro.c
++++ b/src/libs/zbxcacheconfig/user_macro.c
+@@ -1483,8 +1483,12 @@ void	um_cache_remove_hosts(zbx_um_cache_t *cache, const zbx_vector_uint64_t *hos
+ 
+ 		if (NULL != (phost = (zbx_um_host_t **)zbx_hashset_search(&cache->hosts, &phostid)))
+ 		{
++			zbx_um_host_t	*host = *phost;
++
++			/* phost points into the hashset entry that zbx_hashset_remove_direct() */
++			/* frees, so it must be read before the removal, not after               */
+ 			zbx_hashset_remove_direct(&cache->hosts, phost);
+-			um_host_release(*phost);
++			um_host_release(host);
+ 		}
+ 	}
+ }
+diff --git a/src/libs/zbxcachehistory/cachehistory.c b/src/libs/zbxcachehistory/cachehistory.c
+index 1db3f5938a394d6d0fb3848cf23c41b17a203e28..147e92b2a76ce538548b64ad3264ff70be442fc6 100644
+--- a/src/libs/zbxcachehistory/cachehistory.c
++++ b/src/libs/zbxcachehistory/cachehistory.c
+@@ -55,8 +55,10 @@ static zbx_mutex_t	cache_lock = ZBX_MUTEX_NULL;
+ static zbx_mutex_t	trends_lock = ZBX_MUTEX_NULL;
+ static zbx_mutex_t	cache_ids_lock = ZBX_MUTEX_NULL;
+ 
+-static char		*sql = NULL;
+-static size_t		sql_alloc = 4 * ZBX_KIBIBYTE;
++/* Scratch for whichever worker is building a statement. Workers are threads here, so this cannot be shared between */
++/* them. */
++static ZBX_THREAD_LOCAL char	*sql = NULL;
++static ZBX_THREAD_LOCAL size_t	sql_alloc = 4 * ZBX_KIBIBYTE;
+ 
+ static zbx_get_program_type_f	get_program_type_cb = NULL;
+ static zbx_sync_history_cache_f	sync_history_cache_cb = NULL;
+@@ -158,10 +160,13 @@ typedef struct
+ }
+ dc_item_value_t;
+ 
+-static char		*string_values = NULL;
+-static size_t		string_values_alloc = 0, string_values_offset = 0;
+-static dc_item_value_t	*item_values = NULL;
+-static size_t		item_values_alloc = 0, item_values_num = 0;
++/* Where a worker gathers its values before pushing the batch into the shared cache. The batch belongs to the worker, */
++/* not to the program: two of them appending through item_values_num, with a realloc free to move the array, corrupts */
++/* both the batch and the cache it is copied into. */
++static ZBX_THREAD_LOCAL char		*string_values = NULL;
++static ZBX_THREAD_LOCAL size_t		string_values_alloc = 0, string_values_offset = 0;
++static ZBX_THREAD_LOCAL dc_item_value_t	*item_values = NULL;
++static ZBX_THREAD_LOCAL size_t		item_values_alloc = 0, item_values_num = 0;
+ 
+ static void	hc_add_item_values(dc_item_value_t *values, int values_num);
+ static void	hc_queue_item(zbx_hc_item_t *item);
+@@ -208,8 +213,9 @@ void	zbx_dc_get_stats_all(zbx_wcache_info_t *wcache_info)
+  ******************************************************************************/
+ void	*zbx_dc_get_stats(int request)
+ {
+-	static zbx_uint64_t	value_uint;
+-	static double		value_double;
++	/* Returned to the caller by address, so two workers asking at once must not share them. */
++	static ZBX_THREAD_LOCAL zbx_uint64_t	value_uint;
++	static ZBX_THREAD_LOCAL double		value_double;
+ 	void			*ret;
+ 
+ 	LOCK_CACHE;
+diff --git a/src/libs/zbxdiag/diag.c b/src/libs/zbxdiag/diag.c
+index 1372a984091e10cb050cbfb6363eee572714e269..a1ab1bf3e0b885b1951c561245d7a99cab2f9901 100644
+--- a/src/libs/zbxdiag/diag.c
++++ b/src/libs/zbxdiag/diag.c
+@@ -408,7 +408,11 @@ static void	zbx_json_addhex(struct zbx_json *j, const char *name, zbx_uint64_t v
+ void	zbx_diag_add_locks_info(struct zbx_json *json)
+ {
+ 	int		i;
+-#ifdef HAVE_VMINFO_T_UPDATES
++#ifdef _WINDOWS
++	/* Windows mutexes are named kernel objects rather than an indexed table, so there is no address list to */
++	/* report here */
++	ZBX_UNUSED(i);
++#elif defined(HAVE_VMINFO_T_UPDATES)
+ 	const char	*names[ZBX_MUTEX_COUNT] = {"ZBX_MUTEX_LOG", "ZBX_MUTEX_CACHE", "ZBX_MUTEX_TRENDS",
+ 				"ZBX_MUTEX_CACHE_IDS", "ZBX_MUTEX_SELFMON", "ZBX_MUTEX_CPUSTATS", "ZBX_MUTEX_DISKSTATS",
+ 				"ZBX_MUTEX_VALUECACHE", "ZBX_MUTEX_VMWARE", "ZBX_MUTEX_SQLITE3",
+@@ -425,12 +429,14 @@ void	zbx_diag_add_locks_info(struct zbx_json *json)
+ #endif
+ 	zbx_json_addarray(json, ZBX_DIAG_LOCKS);
+ 
++#ifndef _WINDOWS
+ 	for (i = 0; i < ZBX_MUTEX_COUNT; i++)
+ 	{
+ 		zbx_json_addobject(json, NULL);
+ 		zbx_json_addhex(json, names[i], (zbx_uint64_t)zbx_mutex_addr_get(i));
+ 		zbx_json_close(json);
+ 	}
++#endif
+ 
+ 	zbx_json_addobject(json, NULL);
+ 	zbx_json_addhex(json, "ZBX_RWLOCK_CONFIG", (zbx_uint64_t)zbx_rwlock_addr_get(ZBX_RWLOCK_CONFIG));
+diff --git a/src/libs/zbxmutexs/mutexs.c b/src/libs/zbxmutexs/mutexs.c
+index b845e71511aecd149e463b2ac6af18b17595d0b0..b81e5573d54741366308f61a59697b3f1452af2d 100644
+--- a/src/libs/zbxmutexs/mutexs.c
++++ b/src/libs/zbxmutexs/mutexs.c
+@@ -367,6 +367,33 @@ void	zbx_locks_enable(void)
+ #endif
+ #endif	/* _WINDOWS */
+ 
++#ifdef _WINDOWS
++/******************************************************************************
++ *                                                                            *
++ * Purpose: creates process-shared locks                                      *
++ *                                                                            *
++ * Comments: Windows workers are threads of a single process, and             *
++ *           zbx_mutex_create() and zbx_rwlock_create() build their objects   *
++ *           on demand, so there is no pool to set up in advance.             *
++ *                                                                            *
++ ******************************************************************************/
++int	zbx_locks_create(char **error)
++{
++	ZBX_UNUSED(error);
++
++	return SUCCEED;
++}
++
++/******************************************************************************
++ *                                                                            *
++ * Purpose: destroys process-shared locks                                     *
++ *                                                                            *
++ ******************************************************************************/
++void	zbx_locks_destroy(void)
++{
++}
++#endif	/* _WINDOWS */
++
+ /******************************************************************************
+  *                                                                            *
+  * Purpose: Create the mutex                                                  *
+@@ -581,3 +608,128 @@ zbx_mutex_name_t	zbx_mutex_create_per_process_name(const zbx_mutex_name_t prefix
+ 	return name;
+ }
+ #endif
++
++#ifdef _WINDOWS
++/* Read-write locks. Elsewhere these are process-shared pthread locks living in a shared memory segment. On Windows */
++/* every Zabbix worker is a thread of one process, so a plain slim reader/writer lock in static storage covers the */
++/* same ground. SRWLOCK_INIT is all zeroes, which static storage already is, so the table needs no initialisation. */
++/* SRWLOCK is used directly rather than through the POSIX subset in src/libs/zbxwin, because this translation unit is */
++/* also linked into the agent, which does not build that library. */
++
++struct zbx_win_rwlock
++{
++	SRWLOCK	lock;
++};
++
++static struct zbx_win_rwlock	rwlocks[ZBX_RWLOCK_COUNT];
++
++/* Windows releases the shared and the exclusive mode with different calls and cannot be asked which one is held, so */
++/* the mode has to be recorded. It cannot be recorded on the lock: the lock is shared between threads, the answer is */
++/* not - while one thread holds the lock exclusively another may be about to release the shared hold it took before, */
++/* and a single flag tells them both the same thing. Releasing in the wrong mode raises STATUS_RESOURCE_NOT_OWNED and */
++/* takes the process down. Each thread therefore keeps its own record, which no other thread can disturb. The depth */
++/* counts nested holds, which the readers of the configuration cache do take. */
++#define ZBX_RWLOCK_HELD_SHARED		1
++#define ZBX_RWLOCK_HELD_EXCLUSIVE	2
++
++static ZBX_THREAD_LOCAL unsigned char	rwlock_held[ZBX_RWLOCK_COUNT];
++static ZBX_THREAD_LOCAL int		rwlock_depth[ZBX_RWLOCK_COUNT];
++
++int	zbx_rwlock_create(zbx_rwlock_t *rwlock, zbx_rwlock_name_t name, char **error)
++{
++	ZBX_UNUSED(error);
++
++	*rwlock = &rwlocks[name];
++
++	return SUCCEED;
++}
++
++zbx_rwlock_t	zbx_rwlock_addr_get(zbx_rwlock_name_t rwlock_name)
++{
++	return &rwlocks[rwlock_name];
++}
++
++void	__zbx_rwlock_wrlock(const char *filename, int line, zbx_rwlock_t rwlock)
++{
++	int	index;
++
++	ZBX_UNUSED(filename);
++	ZBX_UNUSED(line);
++
++	if (ZBX_RWLOCK_NULL == rwlock)
++		return;
++
++	AcquireSRWLockExclusive(&rwlock->lock);
++
++	index = (int)(rwlock - rwlocks);
++	rwlock_held[index] = ZBX_RWLOCK_HELD_EXCLUSIVE;
++	rwlock_depth[index]++;
++}
++
++void	__zbx_rwlock_rdlock(const char *filename, int line, zbx_rwlock_t rwlock)
++{
++	int	index;
++
++	ZBX_UNUSED(filename);
++	ZBX_UNUSED(line);
++
++	if (ZBX_RWLOCK_NULL == rwlock)
++		return;
++
++	AcquireSRWLockShared(&rwlock->lock);
++
++	index = (int)(rwlock - rwlocks);
++	rwlock_held[index] = ZBX_RWLOCK_HELD_SHARED;
++	rwlock_depth[index]++;
++}
++
++void	__zbx_rwlock_unlock(const char *filename, int line, zbx_rwlock_t rwlock)
++{
++	int	index;
++
++	if (ZBX_RWLOCK_NULL == rwlock)
++		return;
++
++	index = (int)(rwlock - rwlocks);
++
++	if (0 == rwlock_depth[index])
++	{
++		/* releasing a lock this thread never took would corrupt the lock for */
++		/* everyone waiting on it, so say where it came from and do nothing   */
++		zbx_error("[file:'%s',line:%d] read-write lock released by a thread that does not hold it",
++				filename, line);
++		return;
++	}
++
++	if (ZBX_RWLOCK_HELD_EXCLUSIVE == rwlock_held[index])
++		ReleaseSRWLockExclusive(&rwlock->lock);
++	else
++		ReleaseSRWLockShared(&rwlock->lock);
++
++	if (0 == --rwlock_depth[index])
++		rwlock_held[index] = 0;
++}
++
++void	zbx_rwlock_destroy(zbx_rwlock_t *rwlock)
++{
++	/* a slim reader/writer lock holds no resource to release */
++	*rwlock = ZBX_RWLOCK_NULL;
++}
++
++/******************************************************************************
++ *                                                                            *
++ * Purpose: suspend and resume locking                                        *
++ *                                                                            *
++ * Comments: the Unix implementation uses this after fork(), where a child     *
++ *           may inherit a lock held by another thread of the parent. There    *
++ *           is no fork here, so there is nothing to suspend.                  *
++ *                                                                            *
++ ******************************************************************************/
++void	zbx_locks_disable(void)
++{
++}
++
++void	zbx_locks_enable(void)
++{
++}
++#endif	/* _WINDOWS */
+diff --git a/src/libs/zbxshmem/memalloc.c b/src/libs/zbxshmem/memalloc.c
+index a2bb72fa2980b6150ea0f54a0121c90a058d0eaf..12d4936457035afddd5f15edc0685004b0f89fe6 100644
+--- a/src/libs/zbxshmem/memalloc.c
++++ b/src/libs/zbxshmem/memalloc.c
+@@ -113,6 +113,44 @@ static void	__mem_free(zbx_shmem_info_t *info, void *ptr);
+ #define SHMEM_MIN_SIZE		__UINT64_C(128)
+ #define SHMEM_MAX_SIZE		__UINT64_C(0x1000000000)	/* 64 GB */
+ 
++/* Under AddressSanitizer a stale pointer into this segment goes unnoticed: the */
++/* segment is one live allocation, so reading a chunk after it was freed never  */
++/* trips. Poison a free chunk beyond its two list links when it joins a bucket  */
++/* and unpoison it when it leaves, so a use after free inside the segment is    */
++/* reported where it happens rather than as a crash somewhere else later. The   */
++/* links themselves stay readable: the allocator follows them. A normal build   */
++/* compiles this out.                                                           */
++/*                                                                              */
++/* Windows only, where every worker is a thread of one process. Where workers   */
++/* are forked processes the sanitizer's shadow memory is private to each of     */
++/* them: a chunk one process allocates (and unpoisons) stays poisoned in every  */
++/* other process's shadow, so a perfectly valid read of the cache trips, as the */
++/* data sender did on the first run of this under Linux.                        */
++#if defined(__SANITIZE_ADDRESS__) && defined(_WINDOWS)
++#	include <sanitizer/asan_interface.h>
++
++#define SHMEM_LINKS_SIZE	(2 * ZBX_PTR_SIZE)
++
++static void	mem_poison_free_chunk(void *chunk)
++{
++	zbx_uint64_t	size = CHUNK_SIZE(chunk);
++
++	if (size > SHMEM_LINKS_SIZE)
++	{
++		__asan_poison_memory_region((char *)chunk + SHMEM_SIZE_FIELD + SHMEM_LINKS_SIZE,
++				(size_t)(size - SHMEM_LINKS_SIZE));
++	}
++}
++
++static void	mem_unpoison_chunk(void *chunk)
++{
++	__asan_unpoison_memory_region((char *)chunk + SHMEM_SIZE_FIELD, (size_t)CHUNK_SIZE(chunk));
++}
++#else
++#	define mem_poison_free_chunk(chunk)
++#	define mem_unpoison_chunk(chunk)
++#endif
++
+ /* helper functions */
+ 
+ static void	*ALIGN4(void *ptr)
+@@ -208,6 +246,29 @@ static void	mem_link_chunk(zbx_shmem_info_t *info, void *chunk)
+ 	mem_set_next_chunk(chunk, info->buckets[index]);
+ 
+ 	info->buckets[index] = chunk;
++
++	mem_poison_free_chunk(chunk);
++}
++
++/******************************************************************************
++ *                                                                            *
++ * Purpose: reports a link that does not point inside the segment             *
++ *                                                                            *
++ * Comments: Following one faults with nothing to go on. Saying which segment *
++ *           it was, and what the pointer was, turns an access violation into  *
++ *           something that can be acted on.                                   *
++ *                                                                            *
++ ******************************************************************************/
++static void	mem_check_link(const zbx_shmem_info_t *info, const void *chunk, const void *link,
++		const char *what)
++{
++	if (NULL == link || (link >= info->lo_bound && link < info->hi_bound))
++		return;
++
++	zabbix_log(LOG_LEVEL_CRIT, "corrupted free list in \"%s\": the %s link of chunk %p is %p,"
++			" outside [%p, %p)", info->mem_descr, what, chunk, link, info->lo_bound, info->hi_bound);
++	zbx_backtrace();
++	exit(EXIT_FAILURE);
+ }
+ 
+ static void	mem_unlink_chunk(zbx_shmem_info_t *info, void *chunk)
+@@ -221,12 +282,17 @@ static void	mem_unlink_chunk(zbx_shmem_info_t *info, void *chunk)
+ 	prev_chunk = mem_get_prev_chunk(chunk);
+ 	next_chunk = mem_get_next_chunk(chunk);
+ 
++	mem_check_link(info, chunk, prev_chunk, "previous");
++	mem_check_link(info, chunk, next_chunk, "next");
++
+ 	next_in_prev_chunk = mem_ptr_to_next_field(prev_chunk, &info->buckets[index]);
+ 	prev_in_next_chunk = mem_ptr_to_prev_field(next_chunk);
+ 
+ 	*next_in_prev_chunk = next_chunk;
+ 	if (NULL != prev_in_next_chunk)
+ 		*prev_in_next_chunk = prev_chunk;
++
++	mem_unpoison_chunk(chunk);
+ }
+ 
+ /* private memory functions */
+@@ -460,6 +526,23 @@ static void	__mem_free(zbx_shmem_info_t *info, void *ptr)
+ 	int		prev_free, next_free;
+ 
+ 	chunk = (void *)((char *)ptr - SHMEM_SIZE_FIELD);
++
++	/* Both of these leave a free list holding something that is not a link, which is only noticed much later and */
++	/* somewhere else. Saying so here names the caller that did it. */
++	if (chunk < info->lo_bound || chunk >= info->hi_bound)
++	{
++		zabbix_log(LOG_LEVEL_CRIT, "freeing %p in \"%s\", which lies outside [%p, %p)",
++				ptr, info->mem_descr, info->lo_bound, info->hi_bound);
++		zbx_backtrace();
++		exit(EXIT_FAILURE);
++	}
++
++	if (FREE_CHUNK(chunk))
++	{
++		zabbix_log(LOG_LEVEL_CRIT, "freeing %p in \"%s\" a second time", ptr, info->mem_descr);
++		zbx_backtrace();
++		exit(EXIT_FAILURE);
++	}
+ 	chunk_size = CHUNK_SIZE(chunk);
+ 
+ 	info->used_size -= chunk_size;
+@@ -526,7 +609,9 @@ static void	__mem_free(zbx_shmem_info_t *info, void *ptr)
+ int	zbx_shmem_create(zbx_shmem_info_t **info, zbx_uint64_t size, const char *descr, const char *param,
+ 		int allow_oom, char **error)
+ {
+-	int	shm_id, index, ret = FAIL;
++	/* Windows has no segment id; leaving it uninitialised puts noise in the start-up log and in the diagnostics */
++	/* that print it. */
++	int	shm_id = 0, index, ret = FAIL;
+ 	void	*base;
+ 
+ 	descr = ZBX_NULL2STR(descr);
+@@ -551,6 +636,18 @@ int	zbx_shmem_create(zbx_shmem_info_t **info, zbx_uint64_t size, const char *des
+ 		goto out;
+ 	}
+ 
++#ifdef _WINDOWS
++	/* every Zabbix worker is a thread of one process here, so a segment that has to be visible from all of them */
++	/* is ordinary heap */
++	if (NULL == (base = zbx_malloc(NULL, size)))
++	{
++		*error = zbx_dsprintf(*error, "cannot allocate shared memory of size " ZBX_FS_SIZE_T " for %s",
++				(zbx_fs_size_t)size, descr);
++		goto out;
++	}
++
++	memset(base, 0, size);
++#else
+ 	if (-1 == (shm_id = shmget(IPC_PRIVATE, size, 0600)))
+ 	{
+ 		*error = zbx_dsprintf(*error, "cannot get private shared memory of size " ZBX_FS_SIZE_T " for %s: %s",
+@@ -566,6 +663,7 @@ int	zbx_shmem_create(zbx_shmem_info_t **info, zbx_uint64_t size, const char *des
+ 
+ 	if (-1 == shmctl(shm_id, IPC_RMID, NULL))
+ 		zbx_error("cannot mark shared memory %d for destruction: %s", shm_id, zbx_strerror(errno));
++#endif
+ 
+ 	ret = SUCCEED;
+ 
+@@ -661,7 +759,15 @@ int	zbx_shmem_create_min(zbx_shmem_info_t **info, zbx_uint64_t size, const char
+ 
+ void	zbx_shmem_destroy(zbx_shmem_info_t *info)
+ {
++#ifdef _WINDOWS
++	/* The segment is heap here, allocated in zbx_shmem_create(), and the descriptor itself lives at the   */
++	/* start of it. Nothing may touch the descriptor once the block is freed: zbx_free() would write NULL */
++	/* into info->base, inside memory the heap has already taken back (for a cache of some megabytes the  */
++	/* pages are gone at once), which is an access violation on every shutdown.                          */
++	free(info->base);
++#else
+ 	(void)shmdt(info->base);
++#endif
+ }
+ 
+ void	*__zbx_shmem_malloc(const char *file, int line, zbx_shmem_info_t *info, const void *old, size_t size)
+diff --git a/src/zabbix_proxy/cachehistory/cachehistory_proxy.c b/src/zabbix_proxy/cachehistory/cachehistory_proxy.c
+index a1c5f1db2ce89d3dd29165b4e2de59573b105153..89d29854d1298021ebe58343e7ce4186c3c318ea 100644
+--- a/src/zabbix_proxy/cachehistory/cachehistory_proxy.c
++++ b/src/zabbix_proxy/cachehistory/cachehistory_proxy.c
+@@ -28,8 +28,9 @@
+ #include "zbxtime.h"
+ #include "zbxhash.h"
+ 
+-static char	*sql = NULL;
+-static size_t	sql_alloc = 4 * ZBX_KIBIBYTE;
++/* Scratch for whichever syncer is building a statement; they are threads here, so it cannot be shared. */
++static ZBX_THREAD_LOCAL char	*sql = NULL;
++static ZBX_THREAD_LOCAL size_t	sql_alloc = 4 * ZBX_KIBIBYTE;
+ 
+ /******************************************************************************
+  *                                                                            *

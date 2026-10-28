@@ -1,0 +1,183 @@
+SNMP and SSH checks on Windows
+
+Net-SNMP (built from source for MSVC) and libssh2 wired into pollers,
+preprocessing and the trap reader.
+
+diff --git a/src/libs/zbxpoller/checks_snmp.c b/src/libs/zbxpoller/checks_snmp.c
+index 34ecb3bfe51b6ca0ef8df042d219967bad9da2ae..8a8183111c793c82445959a087cb6aa3f8e3982f 100644
+--- a/src/libs/zbxpoller/checks_snmp.c
++++ b/src/libs/zbxpoller/checks_snmp.c
+@@ -3955,17 +3955,23 @@ static int	zbx_snmp_process_standard(struct snmp_session *ss, const zbx_dc_item_
+  *******************************************************************************************/
+ static void	zbx_init_snmp(const char *progname)
+ {
++#ifndef _WINDOWS
+ 	sigset_t	mask, orig_mask;
++#endif
+ 
+ 	if (1 == zbx_snmp_init_done)
+ 		return;
+ 
++#ifndef _WINDOWS
++	/* Net-SNMP initialisation is not async-signal-safe, so the signals the workers use are blocked around it. */
++	/* Windows workers are threads and are not delivered these POSIX signals, so there is nothing to block. */
+ 	sigemptyset(&mask);
+ 	sigaddset(&mask, SIGTERM);
+ 	sigaddset(&mask, SIGUSR2);
+ 	sigaddset(&mask, SIGHUP);
+ 	sigaddset(&mask, SIGQUIT);
+ 	zbx_sigmask(SIG_BLOCK, &mask, &orig_mask);
++#endif
+ 
+ 	netsnmp_ds_set_boolean(NETSNMP_DS_LIBRARY_ID, NETSNMP_DS_LIB_DISABLE_PERSISTENT_LOAD, 1);
+ 	netsnmp_ds_set_boolean(NETSNMP_DS_LIBRARY_ID, NETSNMP_DS_LIB_DISABLE_PERSISTENT_SAVE, 1);
+@@ -3973,7 +3979,9 @@ static void	zbx_init_snmp(const char *progname)
+ 	init_snmp(progname);
+ 	zbx_snmp_init_done = 1;
+ 
++#ifndef _WINDOWS
+ 	zbx_sigmask(SIG_SETMASK, &orig_mask, NULL);
++#endif
+ }
+ 
+ /*******************************************************************************************
+@@ -3984,20 +3992,25 @@ static void	zbx_init_snmp(const char *progname)
+  *******************************************************************************************/
+ static void	zbx_shutdown_snmp(const char *progname)
+ {
++#ifndef _WINDOWS
+ 	sigset_t	mask, orig_mask;
+ 
++	/* see zbx_init_snmp() for why the signal block is Unix-only */
+ 	sigemptyset(&mask);
+ 	sigaddset(&mask, SIGTERM);
+ 	sigaddset(&mask, SIGUSR2);
+ 	sigaddset(&mask, SIGHUP);
+ 	sigaddset(&mask, SIGQUIT);
+ 	zbx_sigmask(SIG_BLOCK, &mask, &orig_mask);
++#endif
+ 
+ 	snmp_shutdown(progname);
+ 
+ 	zbx_snmp_init_done = 0;
+ 
++#ifndef _WINDOWS
+ 	zbx_sigmask(SIG_SETMASK, &orig_mask, NULL);
++#endif
+ }
+ 
+ /******************************************************************************
+diff --git a/src/libs/zbxpoller/ssh2_run.c b/src/libs/zbxpoller/ssh2_run.c
+index f0094f5d7e9b86950a8cbf83fe5f058967fb3904..4e4e93dbafbaaba0cb7a4f51be0e1908d066cc3f 100644
+--- a/src/libs/zbxpoller/ssh2_run.c
++++ b/src/libs/zbxpoller/ssh2_run.c
+@@ -12,8 +12,17 @@
+ ** If not, see <https://www.gnu.org/licenses/>.
+ **/
+ 
++#ifdef HAVE_SSH2
++
+ #include "ssh_run.h"
+ 
++/* ssh_run.h has already brought in Zabbix's ssize_t (zbxtypes.h via zbxcommon.h). */
++/* Under MSVC libssh2.h would typedef ssize_t again unless HAVE_SSIZE_T is set,     */
++/* which collides with Zabbix's definition (C2371); set it so libssh2 keeps ours.   */
++#ifdef _WINDOWS
++#	define HAVE_SSIZE_T
++#endif
++
+ #include <libssh2.h>
+ 
+ #include "zbxcacheconfig.h"
+@@ -570,3 +579,5 @@ ret_label:
+ 	return ret;
+ #undef DATA_BUFFER_SIZE
+ }
++
++#endif	/* HAVE_SSH2 */
+diff --git a/src/libs/zbxpreproc/preproc_snmp.c b/src/libs/zbxpreproc/preproc_snmp.c
+index e81e23e7889e8f23f912c2ed8d177434d3c89d6b..d233fa9f0d0778d654d5786af0dff3fd6480c7b1 100644
+--- a/src/libs/zbxpreproc/preproc_snmp.c
++++ b/src/libs/zbxpreproc/preproc_snmp.c
+@@ -1073,17 +1073,23 @@ out:
+ /* This function has to be moved to separate SNMP library when such refactoring will be done in future */
+ static void	zbx_init_snmp(void)
+ {
++#ifndef _WINDOWS
+ 	sigset_t	mask, orig_mask;
++#endif
+ 
+ 	if (1 == zbx_snmp_init_done)
+ 		return;
+ 
++#ifndef _WINDOWS
++	/* Net-SNMP init is not async-signal-safe; block the workers' signals around it. Windows workers are threads */
++	/* and take no such signals, so there is nothing to block. */
+ 	sigemptyset(&mask);
+ 	sigaddset(&mask, SIGTERM);
+ 	sigaddset(&mask, SIGUSR2);
+ 	sigaddset(&mask, SIGHUP);
+ 	sigaddset(&mask, SIGQUIT);
+ 	zbx_sigmask(SIG_BLOCK, &mask, &orig_mask);
++#endif
+ 
+ 	netsnmp_ds_set_boolean(NETSNMP_DS_LIBRARY_ID, NETSNMP_DS_LIB_DISABLE_PERSISTENT_LOAD, 1);
+ 	netsnmp_ds_set_boolean(NETSNMP_DS_LIBRARY_ID, NETSNMP_DS_LIB_DISABLE_PERSISTENT_SAVE, 1);
+@@ -1093,7 +1099,9 @@ static void	zbx_init_snmp(void)
+ 	netsnmp_init_mib();
+ 	zbx_snmp_init_done = 1;
+ 
++#ifndef _WINDOWS
+ 	zbx_sigmask(SIG_SETMASK, &orig_mask, NULL);
++#endif
+ }
+ 
+ void	preproc_init_snmp(void)
+@@ -1105,18 +1113,23 @@ void	preproc_init_snmp(void)
+ 
+ void	preproc_shutdown_snmp(void)
+ {
++#ifndef _WINDOWS
+ 	sigset_t	mask, orig_mask;
+ 
++	/* see zbx_init_snmp() for why the signal block is Unix-only */
+ 	sigemptyset(&mask);
+ 	sigaddset(&mask, SIGTERM);
+ 	sigaddset(&mask, SIGUSR2);
+ 	sigaddset(&mask, SIGHUP);
+ 	sigaddset(&mask, SIGQUIT);
+ 	zbx_sigmask(SIG_BLOCK, &mask, &orig_mask);
++#endif
+ 
+ 	snmp_shutdown(preproc_get_progname_cb()());
+ 	zbx_snmp_init_done = 0;
+ 
++#ifndef _WINDOWS
+ 	zbx_sigmask(SIG_SETMASK, &orig_mask, NULL);
++#endif
+ }
+ #endif
+diff --git a/src/libs/zbxsnmptrapper/snmptrapper.c b/src/libs/zbxsnmptrapper/snmptrapper.c
+index 1ceb8e1ac6271ffca269e16533b38cbfc9a338c8..1d547080c6f072528af6ad67d4fae033bf8b01b1 100644
+--- a/src/libs/zbxsnmptrapper/snmptrapper.c
++++ b/src/libs/zbxsnmptrapper/snmptrapper.c
+@@ -33,6 +33,7 @@
+ #include "zbxcrypto.h"
+ #include "zbxhash.h"
+ #include "zbxexpr.h"
++#include "zbxfile.h"
+ 
+ static int	trap_fd = -1;
+ static off_t	trap_lastsize;
+@@ -607,7 +608,10 @@ static int	open_trap_file(const char *config_snmptrap_file)
+ 	zbx_stat_t	file_buf;
+ 	char		*error = NULL;
+ 
+-	if (-1 == (trap_fd = open(config_snmptrap_file, O_RDONLY)))
++	/* zbx_open forces O_BINARY on Windows; a text-mode open would translate CRLF */
++	/* and stop at the first 0x1A byte, corrupting the byte-offset accounting this */
++	/* file keeps in trap_lastsize/lseek. On Unix zbx_open is a plain open().      */
++	if (-1 == (trap_fd = zbx_open(config_snmptrap_file, O_RDONLY)))
+ 	{
+ 		if (ENOENT != errno)	/* file exists but cannot be opened */
+ 		{

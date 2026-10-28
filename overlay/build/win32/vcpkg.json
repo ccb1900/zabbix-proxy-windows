@@ -1,0 +1,24 @@
+{
+  "name": "zabbix-proxy-win",
+  "version-string": "7.4.14",
+  "description": "Third-party libraries required to build the Windows Zabbix proxy",
+  "dependencies": [
+    "zlib",
+    "openssl",
+    "pcre2",
+    "libevent",
+    "sqlite3",
+    "libssh2",
+    {
+      "name": "libxml2",
+      "default-features": false
+    },
+    {
+      "name": "curl",
+      "default-features": false,
+      "features": [
+        "openssl"
+      ]
+    }
+  ]
+}

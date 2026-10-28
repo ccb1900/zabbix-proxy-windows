@@ -1,0 +1,563 @@
+name: Build
+
+# Every job builds from the same recipe: upstream Zabbix at the tag in
+# UPSTREAM_VERSION, plus overlay/ and patches/ (scripts/prepare.sh). The tree
+# lands in ./zabbix, which is where every step below runs unless it says
+# otherwise. Pushing a tag v<zabbix version>-<n> (v7.4.16-3) publishes a release.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: zabbix
+
+env:
+  VCPKG_TRIPLET: x64-windows-static
+  NETSNMP_VERSION: 5.9.4
+
+jobs:
+
+  # vcpkg has no net-snmp port, so the SNMP library the proxy needs is built
+  # here from source with Net-SNMP's own win32 build system and cached, keyed on
+  # the version and the build script. It is built --with-ssl against the same
+  # vcpkg OpenSSL the proxy links, so SNMPv3 gets AES and SHA-2.
+  netsnmp:
+    name: Net-SNMP built for MSVC
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore Net-SNMP
+        id: cache-netsnmp
+        uses: actions/cache@v4
+        with:
+          path: netsnmp_installed
+          key: netsnmp-${{ env.NETSNMP_VERSION }}-${{ hashFiles('overlay/build/win32/build_netsnmp.bat', 'overlay/build/win32/vcpkg.json') }}
+
+      - name: Restore third-party libraries
+        if: steps.cache-netsnmp.outputs.cache-hit != 'true'
+        id: cache-vcpkg
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('overlay/build/win32/vcpkg.json') }}
+
+      - name: Install third-party libraries
+        if: steps.cache-netsnmp.outputs.cache-hit != 'true' && steps.cache-vcpkg.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          "%VCPKG_INSTALLATION_ROOT%\vcpkg" install ^
+            --triplet %VCPKG_TRIPLET% ^
+            --x-manifest-root=overlay/build/win32 ^
+            --x-install-root=%GITHUB_WORKSPACE%\vcpkg_installed
+          if errorlevel 1 exit /b 1
+
+      - name: Build Net-SNMP
+        if: steps.cache-netsnmp.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+          set VCPKG=%GITHUB_WORKSPACE%\vcpkg_installed\%VCPKG_TRIPLET%
+          call overlay\build\win32\build_netsnmp.bat %NETSNMP_VERSION% "%GITHUB_WORKSPACE%\netsnmp_installed" "%VCPKG%"
+
+  linux:
+    name: Linux build is not regressed
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare the source tree
+        working-directory: .
+        run: scripts/prepare.sh zabbix
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config gettext \
+            libsqlite3-dev libssl-dev libpcre2-dev libevent-dev \
+            libcurl4-openssl-dev zlib1g-dev libxml2-dev \
+            libpq-dev
+
+      - name: Generate configure
+        run: ./bootstrap.sh
+
+      # The patches touch sources the Linux server, proxy and agent all compile:
+      # the configuration cache, the history cache and the locks are the
+      # server's code before they are the proxy's.
+      - name: Build server, proxy and agent
+        run: |
+          set -o pipefail
+          ./configure --quiet \
+            --enable-server --enable-proxy --enable-agent \
+            --with-postgresql \
+            --with-openssl --with-libpcre2 --with-libcurl
+          make -j"$(nproc)" 2>&1 | tail -40
+          test -x src/zabbix_server/zabbix_server
+          test -x src/zabbix_proxy/zabbix_proxy
+          test -x src/zabbix_agent/zabbix_agentd
+          src/zabbix_server/zabbix_server -V | head -1
+
+      - name: Rebuild the proxy on SQLite
+        run: |
+          ./configure --quiet \
+            --enable-proxy --enable-agent \
+            --with-sqlite3 --with-openssl --with-libpcre2 --with-libcurl
+          make -j"$(nproc)" 2>&1 | tail -40
+          test -x src/zabbix_proxy/zabbix_proxy
+          src/zabbix_proxy/zabbix_proxy -V | head -1
+
+      # The same harness against the Linux binary. It tells a defect this port
+      # introduced from one that was always there.
+      - name: Collect through a stand-in server
+        run: |
+          python3 build/win32/tests/proxy_selftest.py \
+            --exe src/zabbix_proxy/zabbix_proxy --timeout 120
+
+  windows-agent:
+    name: Windows agent is not regressed
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare the source tree
+        working-directory: .
+        shell: bash
+        run: scripts/prepare.sh zabbix
+
+      - name: Restore third-party libraries
+        id: cache-vcpkg
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('overlay/build/win32/vcpkg.json') }}
+
+      - name: Install third-party libraries
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          "%VCPKG_INSTALLATION_ROOT%\vcpkg" install ^
+            --triplet %VCPKG_TRIPLET% ^
+            --x-manifest-root=build/win32 ^
+            --x-install-root=%GITHUB_WORKSPACE%\vcpkg_installed
+          if errorlevel 1 exit /b 1
+
+      # The agent compiles dns.c, comms.c, misc.c, common_log.c, jsonpath.c and
+      # the service layer, all of which the patches change.
+      - name: Build the agent
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+          set VCPKG=%GITHUB_WORKSPACE%\vcpkg_installed\%VCPKG_TRIPLET%
+          cd build\win32\project
+          nmake /f Makefile_agent ^
+            ZBX_REVISION=%GITHUB_SHA:~0,11% ZBX_RC_NUM=0 ^
+            TLS=openssl ^
+            TLSINCDIR=%VCPKG%\include TLSLIBDIR=%VCPKG%\lib ^
+            PCRE2INCDIR=%VCPKG%\include PCRE2LIBDIR=%VCPKG%\lib
+          if errorlevel 1 exit /b 1
+          ..\..\..\bin\win64\zabbix_agentd.exe -V
+
+  asan:
+    name: zabbix_proxy.exe under AddressSanitizer
+    runs-on: windows-latest
+    needs: netsnmp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare the source tree
+        working-directory: .
+        shell: bash
+        run: scripts/prepare.sh zabbix
+
+      - name: Restore third-party libraries
+        id: cache-vcpkg
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('overlay/build/win32/vcpkg.json') }}
+
+      - name: Install third-party libraries
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          "%VCPKG_INSTALLATION_ROOT%\vcpkg" install ^
+            --triplet %VCPKG_TRIPLET% ^
+            --x-manifest-root=build/win32 ^
+            --x-install-root=%GITHUB_WORKSPACE%\vcpkg_installed
+          if errorlevel 1 exit /b 1
+
+      - name: Restore Net-SNMP
+        uses: actions/cache/restore@v4
+        with:
+          path: netsnmp_installed
+          key: netsnmp-${{ env.NETSNMP_VERSION }}-${{ hashFiles('overlay/build/win32/build_netsnmp.bat', 'overlay/build/win32/vcpkg.json') }}
+          fail-on-cache-miss: true
+
+      - name: Generate the database schema source
+        shell: bash
+        run: perl create/bin/gen_schema.pl c > src/libs/zbxdbschema/dbschema.c
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+          set VCPKG=%GITHUB_WORKSPACE%\vcpkg_installed\%VCPKG_TRIPLET%
+          set NETSNMP=%GITHUB_WORKSPACE%\netsnmp_installed
+          cd build\win32\project
+          nmake /f Makefile_proxy ^
+            EXTRA_CFLAGS="/fsanitize=address" ^
+            ZBX_REVISION=%GITHUB_SHA:~0,11% ^
+            TLS=openssl ^
+            TLSINCDIR=%VCPKG%\include TLSLIBDIR=%VCPKG%\lib ^
+            PCRE2INCDIR=%VCPKG%\include PCRE2LIBDIR=%VCPKG%\lib ^
+            SQLITE3INCDIR=%VCPKG%\include SQLITE3LIBDIR=%VCPKG%\lib ^
+            LIBEVENTINCDIR=%VCPKG%\include LIBEVENTLIBDIR=%VCPKG%\lib ^
+            CURLINCDIR=%VCPKG%\include CURLLIBDIR=%VCPKG%\lib ^
+            ZLIBINCDIR=%VCPKG%\include ZLIBLIBDIR=%VCPKG%\lib ^
+            SNMPINCDIR=%NETSNMP%\include SNMPLIBDIR=%NETSNMP%\lib ^
+            SSHINCDIR=%VCPKG%\include SSHLIBDIR=%VCPKG%\lib ^
+            LIBXML2INCDIR=%VCPKG%\include\libxml2 LIBXML2LIBDIR=%VCPKG%\lib
+
+      - name: Place the sanitizer runtime beside the binary
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSPATH=%%i
+          for /f "delims=" %%d in ('dir /b /s "%VSPATH%\clang_rt.asan_dynamic-x86_64.dll" 2^>nul') do copy /y "%%d" bin\win64\ >nul
+          if not exist bin\win64\clang_rt.asan_dynamic-x86_64.dll for /f "delims=" %%d in ('dir /b /s "%ProgramFiles%\clang_rt.asan_dynamic-x86_64.dll" 2^>nul') do copy /y "%%d" bin\win64\ >nul
+          dir /b bin\win64\*.dll
+
+      - name: Collect through a stand-in server
+        run: python build/win32/tests/proxy_selftest.py --timeout 240
+
+      - name: Upload the instrumented binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zabbix_proxy-asan
+          path: |
+            zabbix/bin/win64/zabbix_proxy.exe
+            zabbix/bin/win64/zabbix_proxy.pdb
+            zabbix/bin/win64/clang_rt.asan_dynamic-x86_64.dll
+          if-no-files-found: error
+
+  build:
+    name: zabbix_proxy.exe (x64, MSVC)
+    runs-on: windows-latest
+    needs: netsnmp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ZBX_VERSION comes from UPSTREAM_VERSION. ZBX_NEXT_VERSION packages the
+      # same tree as the following patch release, so the upgrade test has
+      # something to upgrade to; that package is never published.
+      - name: Prepare the source tree
+        working-directory: .
+        shell: bash
+        run: |
+          scripts/prepare.sh zabbix
+          v=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          IFS=. read -r major minor patch <<< "$v"
+          echo "ZBX_VERSION=$v" >> "$GITHUB_ENV"
+          echo "ZBX_NEXT_VERSION=$major.$minor.$((patch + 1))" >> "$GITHUB_ENV"
+
+      - name: Restore third-party libraries
+        id: cache-vcpkg
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('overlay/build/win32/vcpkg.json') }}
+
+      - name: Install third-party libraries
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          "%VCPKG_INSTALLATION_ROOT%\vcpkg" install ^
+            --triplet %VCPKG_TRIPLET% ^
+            --x-manifest-root=build/win32 ^
+            --x-install-root=%GITHUB_WORKSPACE%\vcpkg_installed
+          if errorlevel 1 exit /b 1
+
+      # Saved before building: a failing build is exactly the case where the
+      # ten minutes spent on dependencies must not be paid again.
+      - name: Save third-party libraries
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('overlay/build/win32/vcpkg.json') }}
+
+      - name: Restore Net-SNMP
+        uses: actions/cache/restore@v4
+        with:
+          path: netsnmp_installed
+          key: netsnmp-${{ env.NETSNMP_VERSION }}-${{ hashFiles('overlay/build/win32/build_netsnmp.bat', 'overlay/build/win32/vcpkg.json') }}
+          fail-on-cache-miss: true
+
+      - name: Generate the database schema source
+        shell: bash
+        run: |
+          perl create/bin/gen_schema.pl c > src/libs/zbxdbschema/dbschema.c
+          wc -c src/libs/zbxdbschema/dbschema.c
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+          set VCPKG=%GITHUB_WORKSPACE%\vcpkg_installed\%VCPKG_TRIPLET%
+          set NETSNMP=%GITHUB_WORKSPACE%\netsnmp_installed
+          cd build\win32\project
+          rem /K keeps going after a failed source file, so one run reports every
+          rem compilation error instead of stopping at the first.
+          nmake /K /f Makefile_proxy ^
+            ZBX_REVISION=%GITHUB_SHA:~0,11% ^
+            TLS=openssl ^
+            TLSINCDIR=%VCPKG%\include TLSLIBDIR=%VCPKG%\lib ^
+            PCRE2INCDIR=%VCPKG%\include PCRE2LIBDIR=%VCPKG%\lib ^
+            SQLITE3INCDIR=%VCPKG%\include SQLITE3LIBDIR=%VCPKG%\lib ^
+            LIBEVENTINCDIR=%VCPKG%\include LIBEVENTLIBDIR=%VCPKG%\lib ^
+            CURLINCDIR=%VCPKG%\include CURLLIBDIR=%VCPKG%\lib ^
+            ZLIBINCDIR=%VCPKG%\include ZLIBLIBDIR=%VCPKG%\lib ^
+            SNMPINCDIR=%NETSNMP%\include SNMPLIBDIR=%NETSNMP%\lib ^
+            SSHINCDIR=%VCPKG%\include SSHLIBDIR=%VCPKG%\lib ^
+            LIBXML2INCDIR=%VCPKG%\include\libxml2 LIBXML2LIBDIR=%VCPKG%\lib
+
+      - name: Collect through a stand-in server
+        run: python build/win32/tests/proxy_selftest.py --timeout 120
+
+      - name: Ping thirty hosts on one pinger
+        run: python build/win32/tests/pinger_load_check.py --hosts 30 --dead 3 --pingers 1 --minutes 4
+
+      - name: Register a service the service manager will start
+        shell: pwsh
+        run: >
+          build/win32/tests/service_check.ps1
+          -Exe (Resolve-Path bin/win64/zabbix_proxy.exe).Path
+
+      - name: Stop the running service cleanly
+        shell: pwsh
+        run: >
+          build/win32/tests/service_stop_check.ps1
+          -Exe (Resolve-Path bin/win64/zabbix_proxy.exe).Path
+
+      - name: Keep the crash dump of a stop that went wrong
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zabbix_proxy-stop-dump-${{ github.job }}
+          path: ${{ runner.temp }}/zbx_stop_dumps/*.dmp
+          if-no-files-found: ignore
+
+      - name: Place the trap receiver beside the proxy for packaging
+        shell: cmd
+        run: |
+          copy /y "%GITHUB_WORKSPACE%\netsnmp_installed\bin\snmptrapd.exe" bin\win64\ >nul
+          if errorlevel 1 (echo snmptrapd.exe missing from the netsnmp cache & exit /b 1)
+          dir /b bin\win64\snmptrapd.exe
+
+      - name: Smoke-test the trap receiver
+        shell: cmd
+        run: |
+          bin\win64\snmptrapd.exe -register -quiet -A -Lf "%TEMP%\zbx_traps.tmp" -n udp:10162
+          if errorlevel 1 (echo snmptrapd -register failed & exit /b 1)
+          sc query "Net-SNMP Trap Handler" | findstr /i "STATE" || (echo trap service not registered & exit /b 1)
+          bin\win64\snmptrapd.exe -unregister -quiet
+          if errorlevel 1 (echo snmptrapd -unregister failed & exit /b 1)
+          echo trap receiver registers and unregisters cleanly
+
+      - name: Build the installer
+        shell: cmd
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          if errorlevel 1 exit /b 1
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          cd build\win32\installer
+          python make_license_rtf.py ..\..\..\COPYING license.rtf
+          wix build zabbix_proxy.wxs ^
+            -ext WixToolset.Util.wixext ^
+            -ext WixToolset.UI.wixext ^
+            -arch x64 ^
+            -d Version=%ZBX_VERSION% ^
+            -d BinDir=..\..\..\bin\win64 ^
+            -d ConfDir=..\..\..\conf ^
+            -o ..\..\..\bin\win64\zabbix_proxy-%ZBX_VERSION%-x64.msi
+
+      - name: Install the package and take it apart again
+        shell: pwsh
+        run: >
+          build/win32/tests/installer_check.ps1
+          -Msi (Resolve-Path bin/win64/zabbix_proxy-$env:ZBX_VERSION-x64.msi).Path
+
+      - name: Package the same tree as the next version
+        shell: cmd
+        run: |
+          cd build\win32\installer
+          wix build zabbix_proxy.wxs ^
+            -ext WixToolset.Util.wixext ^
+            -ext WixToolset.UI.wixext ^
+            -arch x64 ^
+            -d Version=%ZBX_NEXT_VERSION% ^
+            -d BinDir=..\..\..\bin\win64 ^
+            -d ConfDir=..\..\..\conf ^
+            -o ..\..\..\bin\win64\zabbix_proxy-%ZBX_NEXT_VERSION%-x64.msi
+
+      - name: Upgrade one version to the next
+        shell: pwsh
+        run: >
+          build/win32/tests/upgrade_check.ps1
+          -OldMsi (Resolve-Path bin/win64/zabbix_proxy-$env:ZBX_VERSION-x64.msi).Path
+          -NewMsi (Resolve-Path bin/win64/zabbix_proxy-$env:ZBX_NEXT_VERSION-x64.msi).Path
+          -NewVersion $env:ZBX_NEXT_VERSION
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: zabbix_proxy-msi
+          path: zabbix/bin/win64/zabbix_proxy-${{ env.ZBX_VERSION }}-x64.msi
+          if-no-files-found: error
+
+      - name: Upload binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zabbix_proxy-x64
+          path: |
+            zabbix/bin/win64/zabbix_proxy.exe
+            zabbix/bin/win64/zabbix_proxy.pdb
+            zabbix/bin/win64/zabbix_proxy.map
+          if-no-files-found: error
+
+  # The same artefact taken apart on each supported Windows Server, rather than
+  # rebuilt: that is what an operator does with a release. Server 2019 is not
+  # here because GitHub retired its runner image.
+  windows-versions:
+    name: The same binary on ${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tests read the schema and their own scripts from the tree.
+      - name: Prepare the source tree
+        working-directory: .
+        shell: bash
+        run: |
+          scripts/prepare.sh zabbix
+          echo "ZBX_VERSION=$(tr -d '[:space:]' < UPSTREAM_VERSION)" >> "$GITHUB_ENV"
+
+      - name: Take the binary the build job produced
+        uses: actions/download-artifact@v4
+        with:
+          name: zabbix_proxy-x64
+          path: zabbix/bin/win64
+
+      - name: Take the installer the build job produced
+        uses: actions/download-artifact@v4
+        with:
+          name: zabbix_proxy-msi
+          path: zabbix/bin/win64
+
+      - name: Say which Windows this is
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          "{0} - {1}" -f $os.Caption, $os.Version
+
+      - name: Collect through a stand-in server
+        run: python build/win32/tests/proxy_selftest.py --timeout 120
+
+      - name: Register a service the service manager will start
+        shell: pwsh
+        run: >
+          build/win32/tests/service_check.ps1
+          -Exe (Resolve-Path bin/win64/zabbix_proxy.exe).Path
+
+      - name: Stop the running service cleanly
+        shell: pwsh
+        run: >
+          build/win32/tests/service_stop_check.ps1
+          -Exe (Resolve-Path bin/win64/zabbix_proxy.exe).Path
+
+      - name: Keep the crash dump of a stop that went wrong
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zabbix_proxy-stop-dump-${{ matrix.os }}
+          path: ${{ runner.temp }}/zbx_stop_dumps/*.dmp
+          if-no-files-found: ignore
+
+      - name: Install the package and take it apart again
+        shell: pwsh
+        run: >
+          build/win32/tests/installer_check.ps1
+          -Msi (Resolve-Path bin/win64/zabbix_proxy-$env:ZBX_VERSION-x64.msi).Path
+
+  # A tag v7.4.16-3 publishes the MSI that passed every job above, with its
+  # checksum. The tag must match UPSTREAM_VERSION so a release can never ship a
+  # binary built from another Zabbix version than its name says.
+  release:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows-agent, asan, build, windows-versions]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag against UPSTREAM_VERSION
+        run: |
+          v=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          case "$GITHUB_REF_NAME" in
+            "v$v-"[0-9]*) echo "ZBX_VERSION=$v" >> "$GITHUB_ENV" ;;
+            *) echo "tag $GITHUB_REF_NAME does not match UPSTREAM_VERSION $v (expected v$v-N)"; exit 1 ;;
+          esac
+
+      - name: Take the installer the build job produced
+        uses: actions/download-artifact@v4
+        with:
+          name: zabbix_proxy-msi
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          msi="zabbix_proxy-${ZBX_VERSION}-x64.msi"
+          sha256sum "$msi" > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" "$msi" SHA256SUMS \
+            --title "Zabbix proxy $ZBX_VERSION for Windows (${GITHUB_REF_NAME#v})" \
+            --notes "Community build of the Zabbix $ZBX_VERSION proxy for Windows x64. Unsigned; check the SHA-256 against SHA256SUMS. Not affiliated with Zabbix SIA. Source: the $GITHUB_REF_NAME tag of this repository plus Zabbix $ZBX_VERSION."

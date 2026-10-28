@@ -1,0 +1,315 @@
+Portability: small MSVC / Windows fixes across shared code
+
+Name resolution, large configuration receive, rand(), DLL modules,
+ODBC, WMI, vault and VMware counters.
+
+diff --git a/src/libs/zbxcfg/cfg.c b/src/libs/zbxcfg/cfg.c
+index 874dd33d64b2510d7fd57c173d07c6ad70c7da37..86433a1d3d8d2885a11df4189d8eaa4a716cc0d3 100644
+--- a/src/libs/zbxcfg/cfg.c
++++ b/src/libs/zbxcfg/cfg.c
+@@ -25,7 +25,11 @@
+ #endif
+ 
+ #if defined(_WINDOWS) || defined(__MINGW32__)
++/* shlwapi.h declares COM interfaces and so needs the 'interface' keyword, which zbxsysinc.h undefines because Zabbix */
++/* uses that word as an identifier */
++#define interface struct
+ #include <shlwapi.h>
++#undef interface
+ #else
+ #include <libgen.h>
+ #endif
+diff --git a/src/libs/zbxcomms/comms.c b/src/libs/zbxcomms/comms.c
+index 399ec29453ed0662cc235064d5006dee22987123..0be03c5fc9a1d6a1df95542e44c2e62cca540e7a 100644
+--- a/src/libs/zbxcomms/comms.c
++++ b/src/libs/zbxcomms/comms.c
+@@ -181,7 +181,7 @@ static int	zbx_socket_peer_ip_save(zbx_socket_t *s)
+ 	return SUCCEED;
+ }
+ 
+-#if !defined(_WINDOWS) && !defined(__MINGW32__)
++/* name resolution through getaddrinfo/getnameinfo, portable */
+ /**
+ *******************************************************************************
+  *                                                                            *
+@@ -317,7 +317,6 @@ out:
+ 		freeaddrinfo(ai);
+ }
+ 
+-#endif	/* _WINDOWS */
+ 
+ #ifdef _WINDOWS
+ /******************************************************************************
+@@ -2102,12 +2101,8 @@ void	zbx_tcp_recv_context_init(zbx_socket_t *s, zbx_tcp_recv_context_t *tcp_recv
+ 	{
+ 		tcp_recv_context->max_len = s->max_len_limit;
+ 	}
+-#if defined(_WINDOWS)
+-	else
+-	{
+-		tcp_recv_context->max_len = ZBX_MAX_RECV_DATA_SIZE;
+-	}
+-#else
++	/* the proxy receives its configuration with ZBX_TCP_LARGE and needs the large limit on Windows too; */
++	/* the agent never passes the flag, so it keeps the default limit as before */
+ 	else if (0 != (flags & ZBX_TCP_LARGE))
+ 	{
+ 		tcp_recv_context->max_len = ZBX_MAX_RECV_LARGE_DATA_SIZE;
+@@ -2116,7 +2111,6 @@ void	zbx_tcp_recv_context_init(zbx_socket_t *s, zbx_tcp_recv_context_t *tcp_recv
+ 	{
+ 		tcp_recv_context->max_len = ZBX_MAX_RECV_DATA_SIZE;
+ 	}
+-#endif
+ 	zbx_socket_free(s);
+ 	tcp_recv_context->allocated = 0;
+ 
+diff --git a/src/libs/zbxeval/execute.c b/src/libs/zbxeval/execute.c
+index 98dbda8d72cdfb0df0ae37d7ef6f2609bc57ef9d..ec8690730a7b646a2b936b38b92817026c2431cc 100644
+--- a/src/libs/zbxeval/execute.c
++++ b/src/libs/zbxeval/execute.c
+@@ -2650,6 +2650,15 @@ static int	eval_execute_math_return_value(const zbx_eval_context_t *ctx, const z
+ 
+ 	if (ZBX_MATH_RANDOM == value)
+ 	{
++#ifdef _WINDOWS
++		LARGE_INTEGER	counter;
++
++		/* the performance counter is the monotonic clock here, and MSVC spells the generator rand() rather */
++		/* than random() */
++		QueryPerformanceCounter(&counter);
++		srand((unsigned int)(counter.QuadPart ^ (counter.QuadPart >> 32)));
++		zbx_variant_set_dbl(&ret_value, rand());
++#else
+ 		struct timespec ts;
+ 
+ 		if (SUCCEED != clock_gettime(CLOCK_MONOTONIC, &ts))
+@@ -2662,6 +2671,7 @@ static int	eval_execute_math_return_value(const zbx_eval_context_t *ctx, const z
+ 			srandom((unsigned int)(ts.tv_nsec ^ ts.tv_sec));
+ 			zbx_variant_set_dbl(&ret_value, random());
+ 		}
++#endif
+ 	}
+ 	else
+ 		zbx_variant_set_dbl(&ret_value, value);
+diff --git a/src/libs/zbxexpression/evalsimple.c b/src/libs/zbxexpression/evalsimple.c
+index af0546821a15d1429ff8582f8fc2df37d56b1099..89741205d4152feb5cb23cd4cfb52ee81638f8aa 100644
+--- a/src/libs/zbxexpression/evalsimple.c
++++ b/src/libs/zbxexpression/evalsimple.c
+@@ -45,10 +45,12 @@
+  ******************************************************************************/
+ 
+ static const char	*ptr;		/* character being looked at */
+-static int		level;		/* expression nesting level  */
++static ZBX_THREAD_LOCAL int	level;			/* expression nesting level  */
+ 
+-static char		*buffer;	/* error message buffer      */
+-static size_t		max_buffer_len;	/* error message buffer size */
++/* The caller's error buffer, held across the recursive descent. Several workers evaluate at once and they are */
++/* threads here, so each has to write to the buffer its own caller passed in. */
++static ZBX_THREAD_LOCAL char	*buffer;		/* error message buffer      */
++static ZBX_THREAD_LOCAL size_t	max_buffer_len;		/* error message buffer size */
+ 
+ /******************************************************************************
+  *                                                                            *
+diff --git a/src/libs/zbxhash/sha512crypt.c b/src/libs/zbxhash/sha512crypt.c
+index fce7014509e34d69911ff64039da072d7aa71d50..d135650e24a343b177422632f2028a3df0cb14ce 100644
+--- a/src/libs/zbxhash/sha512crypt.c
++++ b/src/libs/zbxhash/sha512crypt.c
+@@ -9,6 +9,10 @@ Released into the Public Domain by Ulrich Drepper <drepper@redhat.com>.  */
+ /* Nothing to do in HP-UX */
+ #elif _AIX
+ /* Nothing to do in AIX */
++#elif defined(_WINDOWS)
++/* every architecture Windows supports is little-endian */
++#	define __LITTLE_ENDIAN	1234
++#	define __BYTE_ORDER	__LITTLE_ENDIAN
+ #else
+ 	#if defined(ZBX_OLD_SOLARIS)
+ 		#include <sys/isa_defs.h>
+diff --git a/src/libs/zbxjson/jsonpath.c b/src/libs/zbxjson/jsonpath.c
+index 35e2863d15eb47ab9ff797bfd99081ed9815f336..1cd13045c3fb48d372115d8ee26c2662c863e32f 100644
+--- a/src/libs/zbxjson/jsonpath.c
++++ b/src/libs/zbxjson/jsonpath.c
+@@ -47,7 +47,7 @@ zbx_jsonobj_index_t;
+ ZBX_PTR_VECTOR_DECL(jsonobj_index_ptr, zbx_jsonobj_index_t *)
+ ZBX_PTR_VECTOR_IMPL(jsonobj_index_ptr, zbx_jsonobj_index_t *)
+ 
+-#if !defined(_WINDOWS) && !defined(__MINGW32__)
++/* the index and its mutex are intra-process; see zbx_jsonpath_index_create() */
+ struct zbx_jsonpath_index
+ {
+ 	zbx_vector_jsonobj_index_ptr_t	indexes;
+@@ -57,7 +57,6 @@ struct zbx_jsonpath_index
+ static zbx_hashset_t	*jsonpath_index_get(zbx_jsonpath_index_t *index, const zbx_jsonobj_t *obj,
+ 		zbx_jsonpath_token_t *token);
+ 
+-#endif
+ 
+ static int	jsonpath_query_object(zbx_jsonpath_context_t *ctx, const zbx_jsonobj_t *obj, int path_depth);
+ static int	jsonpath_query_array(zbx_jsonpath_context_t *ctx, const zbx_jsonobj_t *array, int path_depth);
+@@ -2945,7 +2944,7 @@ int	zbx_jsonobj_query(const zbx_jsonobj_t *obj, const char *path, char **output)
+ 	return zbx_jsonobj_query_ext(obj, NULL, path, output);
+ }
+ 
+-#if !defined(_WINDOWS) && !defined(__MINGW32__)
++/* the jsonpath index is guarded by an intra-process mutex */
+ /* jsonobject index hashset support */
+ 
+ static zbx_hash_t	jsonobj_index_el_hash(const void *v)
+@@ -3190,4 +3189,3 @@ void	zbx_jsonpath_index_free(zbx_jsonpath_index_t *index)
+ 	zbx_free(index);
+ }
+ 
+-#endif
+diff --git a/src/libs/zbxmodules/modules.c b/src/libs/zbxmodules/modules.c
+index a19d574202f0445f5ceae0213d9e5445208ede65..756e1d6dcdefe638bb6135ff0ff712a89db585f4 100644
+--- a/src/libs/zbxmodules/modules.c
++++ b/src/libs/zbxmodules/modules.c
+@@ -18,6 +18,17 @@
+ #include "zbxstr.h"
+ #include "zbxsysinfo.h"
+ #include "zbxalgo.h"
++#include "zbxlog.h"
++
++#ifdef _WINDOWS
++/* a loadable module is a DLL here; the dl* interface maps directly onto the Windows library calls, so the loader */
++/* below stays as it is */
++#	define RTLD_NOW		0
++#	define dlopen(path, mode)	((void)(mode), (void *)LoadLibraryA(path))
++#	define dlsym(lib, sym)		((void *)GetProcAddress((HMODULE)(lib), sym))
++#	define dlclose(lib)		(0 != FreeLibrary((HMODULE)(lib)) ? 0 : -1)
++#	define dlerror()		zbx_strerror_from_system(GetLastError())
++#endif
+ 
+ #define ZBX_MODULE_FUNC_INIT			"zbx_module_init"
+ #define ZBX_MODULE_FUNC_API_VERSION		"zbx_module_api_version"
+diff --git a/src/libs/zbxodbc/odbc.c b/src/libs/zbxodbc/odbc.c
+index aa0c6712bd6fa947f5bf56e14afba5df02daacab..9ccc0946289522209a390dd0c5312e1175d06171 100644
+--- a/src/libs/zbxodbc/odbc.c
++++ b/src/libs/zbxodbc/odbc.c
+@@ -23,6 +23,12 @@
+ #include "zbxstr.h"
+ #include "zbxexpr.h"
+ 
++#ifdef _WINDOWS
++/* the Windows SDK sql.h/sqlext.h build on types from windows.h (RETCODE, the */
++/* SQL* handles), so it must be included first; on Unix these headers stand    */
++/* alone. */
++#	include <windows.h>
++#endif
+ #include <sql.h>
+ #include <sqlext.h>
+ 
+diff --git a/src/libs/zbxsysinfo/common/dns.c b/src/libs/zbxsysinfo/common/dns.c
+index a8a60e84c95274f6f5399818c6142f43a7c390c1..587b985869b6f6109e96fe36775dd80f7bac2995 100644
+--- a/src/libs/zbxsysinfo/common/dns.c
++++ b/src/libs/zbxsysinfo/common/dns.c
+@@ -92,39 +92,11 @@ static char	*get_name(unsigned char *msg, unsigned char *msg_end, unsigned char
+ }
+ #endif	/* !defined(_WINDOWS) && !defined(__MINGW32__)*/
+ 
+-/* Replace zbx_inet_ntop/zbx_inet_pton with inet_ntop/inet_pton in case of drop Windows XP/W2k3 support */
++/* Windows XP and W2k3 shipped no inet_ntop(); this local helper covers the one call site left in this file. The name */
++/* is deliberately local: zbxcomms exports a similarly named function taking a struct sockaddr, and the two would */
++/* collide at link time. */
+ #if defined(_WINDOWS) || defined(__MINGW32__)
+-int	zbx_inet_pton(int af, const char *src, void *dst)
+-{
+-	struct sockaddr_storage	ss;
+-	int			size = sizeof(ss);
+-	char			src_copy[INET6_ADDRSTRLEN + 1];
+-
+-	memset(&ss, '\0', sizeof(ss));
+-	ss.ss_family = af;
+-	zbx_strlcpy(src_copy, src, INET6_ADDRSTRLEN+1);
+-	src_copy[INET6_ADDRSTRLEN] = 0;
+-
+-	if (0 == WSAStringToAddressA(src_copy, af, NULL, (struct sockaddr *)&ss, &size))
+-	{
+-		switch(af)
+-		{
+-			case AF_INET:
+-				*((struct in_addr *)dst) = ((struct sockaddr_in *)&ss)->sin_addr;
+-				return SUCCEED;
+-			case AF_INET6:
+-				*((struct in6_addr *)dst) = ((struct sockaddr_in6 *)&ss)->sin6_addr;
+-				return SUCCEED;
+-			default:
+-				return FAIL;
+-		}
+-		return SUCCEED;
+-	}
+-
+-	return FAIL;
+-}
+-
+-const char *zbx_inet_ntop(int af, const void *src, char *dst, size_t size)
++static const char	*dns_inet_ntop(int af, const void *src, char *dst, size_t size)
+ {
+ 	struct sockaddr_storage ss;
+ 	unsigned long s = size;
+@@ -427,7 +399,7 @@ static int	dns_query(AGENT_REQUEST *request, AGENT_RESULT *result, int short_ans
+ 			case T_AAAA:
+ 				memcpy(&in6addr.s6_addr, &(pDnsRecord->Data.AAAA.Ip6Address), sizeof(in6addr.s6_addr));
+ 				offset += zbx_snprintf(buffer + offset, sizeof(buffer) - offset, " %s",
+-						zbx_inet_ntop(AF_INET6, &in6addr, tmp, sizeof(tmp)));
++						dns_inet_ntop(AF_INET6, &in6addr, tmp, sizeof(tmp)));
+ 				break;
+ 			case T_NS:
+ 				offset += zbx_snprintf(buffer + offset, sizeof(buffer) - offset, " %s",
+diff --git a/src/libs/zbxsysinfo/win32/wmi.cpp b/src/libs/zbxsysinfo/win32/wmi.cpp
+index 77c3b08014c62160d56514881444f22c6fbbaee0..8e17582deb0ea285a3b0ed8e2d4a2e26c67ae5af 100644
+--- a/src/libs/zbxsysinfo/win32/wmi.cpp
++++ b/src/libs/zbxsysinfo/win32/wmi.cpp
+@@ -14,9 +14,17 @@
+ 
+ #include "zbxsysinc.h"
+ 
++/* zbxsysinc.h undefines 'interface', because Zabbix uses the word as an
++   identifier in about a thousand declarations. The COM headers below are the
++   one place that wants the Windows meaning of the keyword, so restore it here
++   and put it back the way the rest of the tree expects afterwards. */
++#define interface struct
++
+ #include <comdef.h>
+ #include <Wbemidl.h>
+ 
++#undef interface
++
+ extern "C"
+ {
+ #	include "../sysinfo.h"
+diff --git a/src/libs/zbxvault/vault.c b/src/libs/zbxvault/vault.c
+index ca1aaa06ed8332ed37d092013302a391eb0460f2..7fcefe5b27fb8bcff4bca10f4bf0698be5618d53 100644
+--- a/src/libs/zbxvault/vault.c
++++ b/src/libs/zbxvault/vault.c
+@@ -189,7 +189,7 @@ int	zbx_vault_token_from_env_get(char **token, char **error)
+ 	*token = zbx_strdup(NULL, ptr);
+ 	unsetenv("VAULT_TOKEN");
+ #else
+-	ZBX_UNUSED(token)
++	ZBX_UNUSED(token);
+ 	ZBX_UNUSED(error);
+ #endif
+ 	return SUCCEED;
+diff --git a/src/libs/zbxvmware/vmware_perfcntr.c b/src/libs/zbxvmware/vmware_perfcntr.c
+index acfa1eecaf61dda8be716ea2912ba098a61f44f0..66affd5e573f5cea27d6710d49829113dca4f6bd 100644
+--- a/src/libs/zbxvmware/vmware_perfcntr.c
++++ b/src/libs/zbxvmware/vmware_perfcntr.c
+@@ -15,6 +15,7 @@
+ #include "vmware_perfcntr.h"
+ 
+ #include "zbxcommon.h"
++#include "zbxthreads.h"
+ 
+ #if defined(HAVE_LIBXML2) && defined(HAVE_LIBCURL)
+ 
+@@ -1531,7 +1532,7 @@ out:
+ 				" up to " ZBX_FS_UI64 " bytes of free VMwareCache memory. Available " ZBX_FS_UI64
+ 				" bytes. Increase value of VMwareCacheSize", perf_data_sz,
+ 				vmware_shmem_get_vmware_mem()->free_size);
+-		exit(EXIT_SUCCESS);
++		zbx_worker_exit(EXIT_SUCCESS);
+ 	}
+ 	else
+ 	{

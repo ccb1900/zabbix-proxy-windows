@@ -1,0 +1,61 @@
+Database: SQLite buffer in WAL mode
+
+History syncers are threads with their own connection; WAL lets one
+writer and the readers proceed together.
+
+diff --git a/src/libs/zbxdb/dbconn.c b/src/libs/zbxdb/dbconn.c
+index ef8c3e8fd172cc2f5bc4be738b1234f3aaee84a5..04b9176b413957b14366ab4b83dc2b5a0ec7d86d 100644
+--- a/src/libs/zbxdb/dbconn.c
++++ b/src/libs/zbxdb/dbconn.c
+@@ -755,6 +755,21 @@ out:
+ 	/* do not return SQLITE_BUSY immediately, wait for N ms */
+ 	sqlite3_busy_timeout(db->conn, SEC_PER_MIN * 1000);
+ 
++	/* Write-ahead logging. The proxy runs several history syncers, each with its own connection to this file. In the */
++	/* default rollback-journal mode every commit takes an exclusive lock on the whole database and the other        */
++	/* connections fall back to disk, so writers and readers exclude each other and their page caches thrash: on      */
++	/* Windows, where the syncers are threads rather than processes, several senders at once drove throughput below   */
++	/* that of a single sender. WAL lets one writer and the readers proceed together and commits by appending, which */
++	/* is what closed most of that gap. */
++	if (0 < (ret = dbconn_execute(db, "pragma journal_mode=wal")))
++		ret = ZBX_DB_OK;
++
++	if (ZBX_DB_OK != ret)
++		goto out;
++
++	/* synchronous stays OFF, the throughput-first choice for a transient buffer that the server is the record for.  */
++	/* WAL with NORMAL was measured to halve the single-sender rate for a checkpoint fsync that buys only power-loss */
++	/* durability the buffer does not need; on an application crash WAL recovers cleanly at either setting. */
+ 	if (0 < (ret = dbconn_execute(db, "pragma synchronous=0")))
+ 		ret = ZBX_DB_OK;
+ 
+diff --git a/src/libs/zbxdb/dbconn_compat.c b/src/libs/zbxdb/dbconn_compat.c
+index 6df16f43f6fa698b8f9f3f886dbd75f4ed054533..6b22877eb9baa0b687ab073b4c54794ebfe2e8d8 100644
+--- a/src/libs/zbxdb/dbconn_compat.c
++++ b/src/libs/zbxdb/dbconn_compat.c
+@@ -18,7 +18,9 @@
+ #include "zbxdbschema.h"
+ #include "zbxtypes.h"
+ 
+-static zbx_dbconn_t	*dbconn;
++/* Each worker owns its database connection. They are separate processes on Unix, so a plain global was per-worker */
++/* there; here they are threads of one process and would otherwise share a single SQLite handle. */
++static ZBX_THREAD_LOCAL zbx_dbconn_t	*dbconn;
+ static int		db_autoincrement;
+ 
+ void	zbx_db_init_autoincrement_options(void)
+diff --git a/src/libs/zbxdbhigh/db.c b/src/libs/zbxdbhigh/db.c
+index e4ce74414355eb2fb17a199639eb1738cfc75d49..109a0c12ccddb5cfb3a9568b2e6855457d01cab3 100644
+--- a/src/libs/zbxdbhigh/db.c
++++ b/src/libs/zbxdbhigh/db.c
+@@ -179,7 +179,9 @@ void	zbx_db_version_info_clear(struct zbx_db_version_info_t *version_info)
+ 	zbx_free(version_info->ext_friendly_current_version);
+ }
+ 
+-static char	buf_string[640];
++/* Handed back to the caller by the two helpers below, so it cannot be shared between workers - they are threads here */
++/* rather than processes. */
++static ZBX_THREAD_LOCAL char	buf_string[640];
+ 
+ /******************************************************************************
+  *                                                                            *

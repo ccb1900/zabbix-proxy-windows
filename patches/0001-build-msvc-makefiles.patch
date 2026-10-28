@@ -1,0 +1,147 @@
+Build: hook the proxy into the MSVC/nmake build
+
+Shared makefile fragments learn about the proxy target and its extra
+libraries; gen_schema.pl tolerates a CRLF checkout.
+
+diff --git a/build/win32/project/Makefile b/build/win32/project/Makefile
+index ce29e81cf390922e11049bec0fcea5c277aaf3bc..6e8f6739deec5a5c4e30c87ff32b8c000ab4d2d4 100644
+--- a/build/win32/project/Makefile
++++ b/build/win32/project/Makefile
+@@ -16,6 +16,9 @@ sender_dll:
+ get:
+ 	nmake /f Makefile_get
+ 
++proxy:
++	nmake /f Makefile_proxy
++
+ clean: agent_clean sender_clean sender_dll_clean get_clean
+ 
+ agent_clean:
+@@ -29,3 +32,6 @@ sender_dll_clean:
+ 
+ get_clean:
+ 	nmake /f Makefile_get clean
++
++proxy_clean:
++	nmake /f Makefile_proxy clean
+diff --git a/build/win32/project/Makefile_agent b/build/win32/project/Makefile_agent
+index 29c41bc8208fb46a6cca0753d702385606547d1d..639eaba9cf148173cbce4b9bad62056368cc77f4 100644
+--- a/build/win32/project/Makefile_agent
++++ b/build/win32/project/Makefile_agent
+@@ -74,6 +74,7 @@ OBJS = \
+ 	..\..\..\src\libs\zbxjson\json.o \
+ 	..\..\..\src\libs\zbxjson\json_parser.o \
+ 	..\..\..\src\libs\zbxjson\jsonpath.o \
++	..\..\..\src\libs\zbxwin\pthread_win.o \
+ 	..\..\..\src\libs\zbxjson\jsonobj.o \
+ 	..\..\..\src\libs\zbxlog\log.o \
+ 	..\..\..\src\libs\zbxmutexs\mutexs.o \
+diff --git a/build/win32/project/Makefile_common.inc b/build/win32/project/Makefile_common.inc
+index f4288b2e7785ac3a39355a981e921635d3657226..73f9e7fa3c54de2798e89c136d0fc0fc46544ddd 100644
+--- a/build/win32/project/Makefile_common.inc
++++ b/build/win32/project/Makefile_common.inc
+@@ -10,13 +10,28 @@ RESOURCE_RC = resource.rc
+ DESC_H = $(PROJECTNAME)_desc.h
+ RESOURCE_RES = $(PROJECTNAME).res
+ 
+-INCS = /I $(PROJECTDIR) /I .\ /I ..\include  /I ..\include\common /I ..\..\..\include /I ..\..\..\include\common
++INCS = $(ADD_INCS) /I $(PROJECTDIR) /I .\ /I ..\include  /I ..\include\common /I ..\..\..\include /I ..\..\..\include\common
++
++# a target may raise this; the proxy needs Vista for condition variables
++!IF "$(WIN32_WINNT)" == ""
++WIN32_WINNT = 0x0502
++!ENDIF
++
++# include/version.h carries release-tooling placeholders for these when the tree
++# comes from git rather than from a release tarball, and the version resource
++# does not compile without them. Override on the command line to stamp a build.
++!IF "$(ZBX_REVISION)" == ""
++ZBX_REVISION = 0
++!ENDIF
++!IF "$(ZBX_RC_NUM)" == ""
++ZBX_RC_NUM = 0
++!ENDIF
+ 
+ !IF "$(CPU)" == "i386" || "$(CPU)" == "x86"
+-COMMON_FLAGS = /D _WIN32_WINNT=0x0502
++COMMON_FLAGS = /D _WIN32_WINNT=$(WIN32_WINNT)
+ ADD_LFLAGS = $(ADD_LFLAGS) /SUBSYSTEM:"CONSOLE,5.01"
+ !ELSEIF "$(CPU)" == "AMD64"
+-COMMON_FLAGS = /D _WIN32_WINNT=0x0502
++COMMON_FLAGS = /D _WIN32_WINNT=$(WIN32_WINNT)
+ ADD_LFLAGS = $(ADD_LFLAGS) /SUBSYSTEM:"CONSOLE,5.02"
+ !ENDIF
+ 
+@@ -27,7 +42,9 @@ OPTS = /O2
+ !ENDIF
+ 
+ COMMON_FLAGS = $(COMMON_FLAGS) /nologo $(OPTS) /GF /FD /EHsc /MT /Gy /W3 /c /D _WINDOWS /D _CONSOLE /D UNICODE \
+-	/D _UNICODE /D HAVE_WINLDAP_H /D HAVE_ASSERT_H /D ZABBIX_SERVICE /D "_VC80_UPGRADE=0x0600" /D HAVE_IPV6
++	/D _UNICODE /D HAVE_WINLDAP_H /D HAVE_ASSERT_H /D ZABBIX_SERVICE /D "_VC80_UPGRADE=0x0600" /D HAVE_IPV6 \
++	/D ZABBIX_VERSION_REVISION=$(ZBX_REVISION) /D ZABBIX_VERSION_RC_NUM=$(ZBX_RC_NUM) \
++	$(EXTRA_CFLAGS)
+ 
+ CFLAGS = $(CFLAGS) $(INCS) $(ADD_CFLAGS) $(COMMON_FLAGS) /TC
+ 
+@@ -36,4 +53,5 @@ CPPFLAGS = $(INCS) $(ADD_CFLAGS) $(COMMON_FLAGS) /TP
+ LFLAGS = /NOLOGO $(ADD_LFLAGS) /INCREMENTAL:NO /MANIFEST /MANIFESTFILE:"$(TARGETNAME).$(TARGETEXT).manifest" \
+ 	/MANIFESTUAC:"level='asInvoker' uiAccess='false'" /DYNAMICBASE:NO /PDB:$(TARGETDIR)\$(TARGETNAME).pdb
+ 
+-RFLAGS = $(RFLAGS) $(ADD_RFLAGS) /d _WINDOWS
++RFLAGS = $(RFLAGS) $(ADD_RFLAGS) /d _WINDOWS \
++	/d ZABBIX_VERSION_REVISION=$(ZBX_REVISION) /d ZABBIX_VERSION_RC_NUM=$(ZBX_RC_NUM)
+diff --git a/build/win32/project/Makefile_targets.inc b/build/win32/project/Makefile_targets.inc
+index 50db96d53bab05ef70b1ade079664740de0378fd..ec80557e7184e83cf81bbd2f1740f8491871aa9a 100644
+--- a/build/win32/project/Makefile_targets.inc
++++ b/build/win32/project/Makefile_targets.inc
+@@ -135,6 +135,9 @@ $(RESOURCE_RES): $(RESOURCE_RC) $(RESOURCE_H) $(DESC_H)
+ {..\..\..\src\libs\zbxwinservice}.c{..\..\..\src\libs\zbxwinservice}.o:
+ 	$(CC) $? /Fo"$@" $(CFLAGS)
+ 
++{..\..\..\src\libs\zbxwin}.c{..\..\..\src\libs\zbxwin}.o:
++	$(CC) $? /Fo"$@" $(CFLAGS)
++
+ {..\..\..\src\libs\zbxagentget}.c{..\..\..\src\libs\zbxagentget}.o:
+ 	$(CC) $? /Fo"$@" $(CFLAGS)
+ 
+diff --git a/build/win32/project/Makefile_tls.inc b/build/win32/project/Makefile_tls.inc
+index 4d66a8af9c25725b2b9e0ec1f827b45daddd53f7..e7f80771fa1e46aaa02ef9a582ae0fe28dbfd95a 100644
+--- a/build/win32/project/Makefile_tls.inc
++++ b/build/win32/project/Makefile_tls.inc
+@@ -65,7 +65,7 @@ CFLAGS =	$(CFLAGS) /DHAVE_OPENSSL /DHAVE_OPENSSL_WITH_PSK
+ !		IF !EXISTS("$(TLSLIB2)")
+ !			ERROR TLS library "$(TLSLIB2)" not found. $(ADDMSG)
+ !		ENDIF
+-LIBS =		$(LIBS) "$(TLSLIB)" "$(TLSLIB2)"
++LIBS =		$(LIBS) "$(TLSLIB)" "$(TLSLIB2)" crypt32.lib
+ !	ELSE
+ LIBS =		$(LIBS) "$(TLSLIB)"
+ !	ENDIF
+diff --git a/build/win32/project/resource.h b/build/win32/project/resource.h
+index 82dc0669731110432da0cb0f5f66fc4558567d8e..a046c0242d67496602571b368b50ae395b002370 100644
+--- a/build/win32/project/resource.h
++++ b/build/win32/project/resource.h
+@@ -29,6 +29,8 @@
+ #	include "zabbix_sender_desc.h"
+ #elif defined(ZABBIX_AGENT2)
+ #	include "zabbix_agent2_desc.h"
++#elif defined(ZABBIX_PROXY)
++#	include "zabbix_proxy_desc.h"
+ #endif
+ 
+ #define VER_FILEVERSION		ZABBIX_VERSION_MAJOR,ZABBIX_VERSION_MINOR,ZABBIX_VERSION_PATCH,ZABBIX_VERSION_RC_NUM
+diff --git a/create/bin/gen_schema.pl b/create/bin/gen_schema.pl
+index e180c8b610c5163530151830ab09889ed3cb6027..ff4805d910e1fd934bdb95774185f257da1100e7 100755
+--- a/create/bin/gen_schema.pl
++++ b/create/bin/gen_schema.pl
+@@ -931,7 +931,9 @@ sub process()
+ 	foreach my $line (@lines)
+ 	{
+ 		$line =~ tr/\t//d;
+-		chop($line);
++		# chop() would leave the carriage return of a CRLF checkout
++		# attached to the last field of every line
++		$line =~ s/[\r\n]+$//;
+ 
+ 		my ($type, $opts) = split(/\|/, $line, 2);
+ 

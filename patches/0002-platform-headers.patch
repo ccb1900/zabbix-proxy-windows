@@ -1,0 +1,281 @@
+Headers: Windows definitions for the types and primitives the proxy needs
+
+POSIX types, thread and service declarations that the Unix build gets
+from the system headers.
+
+diff --git a/include/common/zbxsysinc.h b/include/common/zbxsysinc.h
+index 31149e9bab8c340c4a8d6419fd7d45149130e42e..55a9954edf530bca03d8532a895ec80642e9dbce 100644
+--- a/include/common/zbxsysinc.h
++++ b/include/common/zbxsysinc.h
+@@ -421,4 +421,48 @@
+ #	include <libgen.h>
+ #endif
+ 
++#ifdef _WINDOWS
++/* rpcndr.h, reached through winsock2.h and Iphlpapi.h, defines 'interface' as a macro. Zabbix uses that word as an */
++/* identifier in about a thousand places - zbx_dc_interface_t interface; and the like - which the substitution turns */
++/* into syntax errors. Nothing here uses the COM meaning of the keyword. */
++#	undef interface
++
++/* access() mode constants, which MSVC declares the function for but does not name. Windows has no execute permission */
++/* to test, so X_OK checks for read, which is what _access() accepts. */
++#	ifndef F_OK
++#		define F_OK	0
++#		define W_OK	2
++#		define R_OK	4
++#		define X_OK	R_OK
++#	endif
++
++/* guard shared with the MSVC <sys/types.h>, which declares _mode_t but only exposes mode_t under the non-standard */
++/* names option */
++#	ifndef _MODE_T_DEFINED
++#		define _MODE_T_DEFINED
++typedef int	mode_t;
++#	endif
++
++/* runtime control identifies a target by process id; the guard is the one the MSVC headers use, so whichever */
++/* declaration comes first wins */
++#	ifndef _PID_T_
++#		define _PID_T_
++typedef int	pid_t;
++#	endif
++
++/* the worker pools of the discoverer, the asynchronous pollers and the preprocessing manager synchronise with POSIX */
++/* threads directly */
++#	include "zbxwinpthread.h"
++
++/* MSVC spells the reentrant tokeniser differently, with the same signature */
++#	define strtok_r	strtok_s
++
++/* implemented in src/libs/zbxwin/posix_win.c */
++struct timeval;
++int		nanosleep(const struct timespec *req, struct timespec *rem);
++unsigned int	sleep(unsigned int seconds);
++int		gettimeofday(struct timeval *tv, void *tz);
++char		*strptime(const char *s, const char *format, struct tm *tm);
++#endif
++
+ #endif
+diff --git a/include/common/zbxtypes.h b/include/common/zbxtypes.h
+index f765ecd027b1779710b0be1a6d68d6edb42d3cd6..c04a8212cdf944c49c70a1169efd9cceaf108ab6 100644
+--- a/include/common/zbxtypes.h
++++ b/include/common/zbxtypes.h
+@@ -26,12 +26,24 @@
+ #if defined(_WINDOWS)
+ #	include <strsafe.h>
+ 
++/* These have to widen the constant, not just pass it through. Without the suffix the literal stays an int, and a */
++/* shift such as the one that builds SHMEM_FLG_USED - (__UINT64_C(1)) << 63 - shifts past the width of its type and */
++/* yields zero. The shared memory allocator then cannot tell a used chunk from a free one. The definitions below */
++/* match the ones used everywhere else. */
+ #	ifndef __UINT64_C
+-#		define __UINT64_C(x)	x
++#		ifdef UINT64_C
++#			define __UINT64_C(c)	(UINT64_C(c))
++#		else
++#			define __UINT64_C(c)	(c ## ULL)
++#		endif
+ #	endif
+ 
+ #	ifndef __INT64_C
+-#		define __INT64_C(x)	x
++#		ifdef INT64_C
++#			define __INT64_C(c)	(INT64_C(c))
++#		else
++#			define __INT64_C(c)	(c ## LL)
++#		endif
+ #	endif
+ 
+ #	define zbx_uint64_t	unsigned __int64
+@@ -191,6 +203,9 @@ zbx_uint128_t;
+ 
+ #if defined(_WINDOWS) || defined(__MINGW32__)
+ 	#define localtime_r(x, y)	localtime_s(y, x)
++	/* MSVC has no gmtime_r; gmtime_s takes (dest, src) like localtime_s and the */
++	/* callers ignore the return value, so the same mapping holds. */
++	#define gmtime_r(x, y)		gmtime_s(y, x)
+ #endif
+ 
+ typedef struct zbx_variant zbx_variant_t;
+diff --git a/include/zbxcommon.h b/include/zbxcommon.h
+index 70ee250f90477b35127ed4b21b4fbfa0790c5a9b..b8df3b8763ca0fbad13f4e9c4c136e55d896fa1a 100644
+--- a/include/zbxcommon.h
++++ b/include/zbxcommon.h
+@@ -451,6 +451,7 @@ typedef enum
+ 	ZBX_TASK_START_SERVICE,
+ 	ZBX_TASK_STOP_SERVICE,
+ 	ZBX_TASK_SET_SERVICE_STARTUP_TYPE,
++	ZBX_TASK_RUNTIME_CONTROL,
+ #else
+ 	ZBX_TASK_RUNTIME_CONTROL,
+ #endif
+@@ -805,7 +806,8 @@ int	zbx_get_log_level(void);
+ void	zbx_set_log_level(int level);
+ const char	*zbx_get_log_component_name(void);
+ 
+-#ifndef _WINDOWS
++/* The per-component log level is plain C. It was behind a Unix guard only because the agent has no use for it; the */
++/* proxy worker pools do. */
+ void		zabbix_increase_log_level(void);
+ void		zabbix_decrease_log_level(void);
+ void		zabbix_report_log_level_change(void);
+@@ -820,6 +822,9 @@ zbx_log_component_t;
+ 
+ void	zbx_set_log_component(const char *name, zbx_log_component_t *component);
+ void	zbx_change_component_log_level(zbx_log_component_t *component, int direction);
++
++#ifndef _WINDOWS
++/* malloc_trim() is a glibc extension */
+ void	zbx_malloc_trim(time_t now, int period, size_t pad);
+ #endif
+ 
+diff --git a/include/zbxnix.h b/include/zbxnix.h
+index 9a21943ae96e3b530d54dcd2c5ebd5796fef1ed4..4890834b51802bbd19c2171ce8c0ad07098de0dd 100644
+--- a/include/zbxnix.h
++++ b/include/zbxnix.h
+@@ -30,7 +30,11 @@ int	zbx_coredump_disable(void);
+ 
+ /* daemon start */
+ #if defined(_WINDOWS)
+-#	error "This module allowed only for Unix OS"
++/* The Windows proxy implements this interface in src/libs/zbxwin. Every worker is a thread of one process there */
++/* rather than a forked child, which is what shapes the two differences below. There are no POSIX signals to mask, so */
++/* the signal-set operations are no-ops. Their callers still declare the mask they pass, so the type has to exist; */
++/* MSVC does not provide it. */
++typedef int	sigset_t;
+ #endif
+ 
+ typedef int	(*zbx_get_process_info_by_thread_f)(int local_server_num, unsigned char *local_process_type,
+@@ -126,7 +130,8 @@ void	zbx_unset_exit_on_terminate(void);
+ 
+ void	zbx_log_exit_signal(void);
+ void	zbx_set_on_exit_args(void *args);
+-void	zbx_set_child_pids(pid_t *pids, size_t pid_num);
++/* the callers pass the thread handle table, which is pid_t on Unix */
++void	zbx_set_child_pids(ZBX_THREAD_HANDLE *pids, size_t pid_num);
+ /* sighandler end */
+ 
+ int	zbx_parse_rtc_options(const char *opt, int *message);
+diff --git a/include/zbxself.h b/include/zbxself.h
+index cec9b880b422fdd04d76bb3ed754a6e77ebf6496..716de9adc1543e9d8e443b4042c41e00e782743e 100644
+--- a/include/zbxself.h
++++ b/include/zbxself.h
+@@ -22,7 +22,7 @@
+ 
+ #define ZBX_SELFMON_DELAY		1
+ 
+-#ifndef _WINDOWS
++/* the implementation is plain C over shared memory and a mutex */
+ #include "zbxthreads.h"
+ #include "zbxstats.h"
+ 
+@@ -35,6 +35,5 @@ void	zbx_get_selfmon_stats(unsigned char proc_type, unsigned char aggr_func, int
+ 		double *value);
+ int	zbx_get_all_process_stats(zbx_process_info_t *stats);
+ void	zbx_sleep_loop(const zbx_thread_info_t *info, int sleeptime);
+-#endif
+ 
+ #endif	/* ZABBIX_ZBXSELF_H */
+diff --git a/include/zbxthreads.h b/include/zbxthreads.h
+index f3dd371603b652aeef508acd2d171c91048da8a7..399b4da57424f9a546066e5de18b1dc0fb1f809f 100644
+--- a/include/zbxthreads.h
++++ b/include/zbxthreads.h
+@@ -17,6 +17,13 @@
+ 
+ #include "zbxcommon.h"
+ 
++/* the order workers are asked to stop in, on either platform */
++#define ZBX_THREAD_PRIORITY_NONE	0
++#define ZBX_THREAD_PRIORITY_COLLECTOR	1
++#define ZBX_THREAD_PRIORITY_SYNCER	2
++#define ZBX_THREAD_PRIORITY_WORKER	3
++#define ZBX_THREAD_PRIORITY_COUNT	4
++
+ #if defined(_WINDOWS) || defined(__MINGW32__)
+ 	/* the ZBXEndThread function is implemented in service.c file */
+ 	void	CALLBACK ZBXEndThread(ULONG_PTR dwParam);
+@@ -26,8 +33,6 @@
+ 	#define ZBX_THREAD_HANDLE		HANDLE
+ 	#define ZBX_THREAD_HANDLE_NULL		NULL
+ 
+-	#define ZBX_THREAD_PRIORITY_NONE	0
+-
+ 	#define ZBX_THREAD_ENTRY_POINTER(pointer_name)		\
+ 		unsigned (__stdcall *pointer_name)(void *)
+ 
+@@ -53,11 +58,6 @@
+ 	#define ZBX_THREAD_HANDLE		pid_t
+ 	#define ZBX_THREAD_HANDLE_NULL		0
+ 
+-	#define ZBX_THREAD_PRIORITY_NONE	0
+-	#define ZBX_THREAD_PRIORITY_COLLECTOR	1
+-	#define ZBX_THREAD_PRIORITY_SYNCER	2
+-	#define ZBX_THREAD_PRIORITY_WORKER	3
+-	#define ZBX_THREAD_PRIORITY_COUNT	4
+ 
+ 	#define ZBX_THREAD_ENTRY_POINTER(pointer_name)	\
+ 		unsigned (* pointer_name)(void *)
+@@ -76,6 +76,16 @@
+ 	#define zbx_thread_kill_fatal(h)	kill(h, SIGHUP)
+ #endif	/* _WINDOWS */
+ 
++/* Ends a worker that has finished on its own: a process on Unix, where this is exit(), and a thread on      */
++/* Windows, where exit() would end the whole program, every other worker and the service with it. Unlike      */
++/* zbx_thread_exit() it keeps exit()'s semantics on Unix and can be used at any depth of the worker, as both   */
++/* forms are declared noreturn.                                                                                */
++#if defined(_WINDOWS) || defined(__MINGW32__)
++	#define zbx_worker_exit(status)		_endthreadex((unsigned int)(status))
++#else
++	#define zbx_worker_exit(status)		exit((int)(status))
++#endif
++
+ typedef struct
+ {
+ 	unsigned char	program_type;
+@@ -99,8 +109,6 @@ void	zbx_thread_start(ZBX_THREAD_ENTRY_POINTER(handler), zbx_thread_args_t *thre
+ int	zbx_thread_wait(ZBX_THREAD_HANDLE thread);
+ void	zbx_threads_kill_and_wait(ZBX_THREAD_HANDLE *threads, const int *threads_flags, int threads_num, int ret);
+ 
+-#if !defined(_WINDOWS) && !defined(__MINGW32__)
+ void	zbx_pthread_init_attr(pthread_attr_t *attr);
+-#endif
+ 
+ #endif	/* ZABBIX_THREADS_H */
+diff --git a/include/zbxvariant.h b/include/zbxvariant.h
+index 8b0b2432727952ce8990e6d29f482bbe7ee0bad4..20f2deb060fdf7848858b206a51491dc548a4d16 100644
+--- a/include/zbxvariant.h
++++ b/include/zbxvariant.h
+@@ -17,8 +17,14 @@
+ 
+ #include "zbxalgo.h"
+ 
++/* MSVC rejects a division by zero in a constant expression, so the same IEEE values are named through HUGE_VAL there */
++#ifdef _WINDOWS
++#define ZBX_INFINITY	HUGE_VAL	/* "Positive infinity" value used as a fatal error code */
++#define ZBX_UNKNOWN	(-HUGE_VAL)	/* "Negative infinity" value used as a code for "Unknown" */
++#else
+ #define ZBX_INFINITY	(1.0 / 0.0)	/* "Positive infinity" value used as a fatal error code */
+ #define ZBX_UNKNOWN	(-1.0 / 0.0)	/* "Negative infinity" value used as a code for "Unknown" */
++#endif
+ 
+ #define ZBX_UNKNOWN_STR		"ZBX_UNKNOWN"	/* textual representation of ZBX_UNKNOWN */
+ #define ZBX_UNKNOWN_STR_LEN	ZBX_CONST_STRLEN(ZBX_UNKNOWN_STR)
+diff --git a/include/zbxwinservice.h b/include/zbxwinservice.h
+index 70350dc53acab5b69de4ed48982589d0640e2829..d05ebc79f227563235e69220c4f9487a784344a6 100644
+--- a/include/zbxwinservice.h
++++ b/include/zbxwinservice.h
+@@ -26,10 +26,13 @@
+ #define ZBX_SERVICE_STARTUP_MANUAL	"manual"
+ #define ZBX_SERVICE_STARTUP_DISABLED	"disabled"
+ 
+-typedef void	(*zbx_on_exit_t)(int);
++/* kept identical to the declaration in zbxnix.h: the proxy includes both */
++typedef void	(*zbx_on_exit_t)(int, void *);
+ 
+ void	zbx_service_init(zbx_get_config_str_f get_zbx_service_name_f, zbx_get_config_str_f get_zbx_event_source_f);
+ void	zbx_service_start(int flags);
++void	zbx_service_stop_from_main_thread(void);
++void	zbx_service_report_stop_pending(void);
+ 
+ int	ZabbixCreateService(const char *path, const char *config_file, unsigned int flags);
+ int	ZabbixRemoveService(void);
