@@ -77,6 +77,7 @@ scripts/
   prepare.sh       upstream tag + overlay + patches -> ./zabbix
   prepare.ps1      the same, from PowerShell (uses Git for Windows' bash)
   refresh-patches.sh   turn edits made in ./zabbix back into overlay/ and patches/
+  rebase.sh        carry the port onto another Zabbix release, three-way, with a report
 .github/workflows/ build, test, package, release
 ```
 
@@ -106,8 +107,11 @@ git diff patches/ overlay/    # review, commit
 A change to an upstream file goes to the patch that already owns that file.
 A file no patch owns goes to `patches/9999-unsorted.patch` until you move it.
 
-Moving to a new Zabbix release: change `UPSTREAM_VERSION`, run `prepare.sh`,
-fix the first patch that no longer applies, run `refresh-patches.sh`, repeat.
+Moving to a new Zabbix release: `scripts/rebase.sh <version>` applies every
+patch three-way and lists the conflicts. Resolve them in `./zabbix`, write the
+version to `UPSTREAM_VERSION`, run `refresh-patches.sh`. A weekly workflow
+(`upstream-watch.yml`) runs the same check against the newest 7.4 and 8.0
+releases, so a breaking upstream change shows up before release day.
 
 Releases: push a tag `v<zabbix version>-<n>` (for example `v7.4.16-3`). CI
 publishes the MSI once every job passes.

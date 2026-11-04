@@ -1,0 +1,106 @@
+name: Upstream watch
+
+# Every Monday, carry the port onto the newest Zabbix release of each watched
+# series (the one in UPSTREAM_VERSION and the next one) and report what no
+# longer applies. It builds nothing and blocks nothing: it says early how much
+# work the next release will be, instead of finding out on release day.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Zabbix tag to try (empty = newest of each watched series)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  pick:
+    name: Pick the releases to try
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.pick.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Watched series: the current one, and the next major (8.0 while the port
+      # is on 7.4). Release candidates count: that is when the work should start.
+      - id: pick
+        env:
+          INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [ -n "$INPUT" ]; then
+            echo "versions=[\"$INPUT\"]" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          current=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          series_cur=${current%.*}
+          series_next=8.0
+          tags=$(git ls-remote --tags https://github.com/zabbix/zabbix | awk '{print $2}' \
+                 | sed 's|refs/tags/||' | grep -v '\^{}')
+          newest() { echo "$tags" | grep -E "^$1\.[0-9]+((alpha|beta|rc)[0-9]+)?$" \
+                     | sed -E 's/^([0-9.]+)$/\1zz/' | sort -V | tail -1 | sed 's/zz$//'; }
+          list=()
+          for s in "$series_cur" "$series_next"; do
+            v=$(newest "$s"); [ -n "$v" ] && [ "$v" != "$current" ] && list+=("\"$v\"")
+          done
+          echo "versions=[$(IFS=,; echo "${list[*]}")]" >> "$GITHUB_OUTPUT"
+          echo "current $current, trying: ${list[*]:-nothing new}"
+
+  rebase:
+    name: Port onto ${{ matrix.version }}
+    needs: pick
+    if: needs.pick.outputs.versions != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.pick.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply overlay and patches three-way
+        id: rebase
+        run: |
+          set +e
+          REPORT="$RUNNER_TEMP/report.md" scripts/rebase.sh "${{ matrix.version }}" zabbix
+          rc=$?
+          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
+          echo "conflicts=$([ "$rc" -eq 3 ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+
+      # Files new in the release are invisible to the patches but not to the
+      # nmake build, which lists its objects by hand: show which sources appeared
+      # under directories the proxy compiles.
+      - name: List sources new in this release
+        run: |
+          cd zabbix
+          old=$(tr -d '[:space:]' < ../UPSTREAM_VERSION)
+          {
+            echo
+            echo "### Sources added upstream since $old"
+            echo
+            echo '```'
+            git diff --name-only --diff-filter=A "$old" upstream -- 'src/libs/**/*.c' 'src/zabbix_proxy/**/*.c' | head -200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the tree with its conflict markers
+        if: steps.rebase.outputs.conflicts == 'yes'
+        run: |
+          cd zabbix
+          git diff upstream > "$RUNNER_TEMP/port-on-${{ matrix.version }}.diff"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.rebase.outputs.conflicts == 'yes'
+        with:
+          name: port-on-${{ matrix.version }}
+          path: ${{ runner.temp }}/port-on-${{ matrix.version }}.diff
+
+      - name: Fail the run when there is work to do
+        if: steps.rebase.outputs.conflicts == 'yes'
+        run: |
+          echo "::warning::The port does not apply cleanly on ${{ matrix.version }}; see the summary."
+          exit 1

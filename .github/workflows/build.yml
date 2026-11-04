@@ -7,10 +7,10 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, "7.4", "port-*"]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [main, "7.4", "port-*"]
   workflow_dispatch:
 
 permissions:
@@ -268,7 +268,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ZBX_VERSION comes from UPSTREAM_VERSION. ZBX_NEXT_VERSION packages the
+      # ZBX_VERSION comes from UPSTREAM_VERSION and may be a pre-release
+      # (8.0.0rc3): it names the files. An MSI version must be numeric, so
+      # ZBX_MSI_VERSION drops the suffix (8.0.0). ZBX_NEXT_VERSION packages the
       # same tree as the following patch release, so the upgrade test has
       # something to upgrade to; that package is never published.
       - name: Prepare the source tree
@@ -277,8 +279,10 @@ jobs:
         run: |
           scripts/prepare.sh zabbix
           v=$(tr -d '[:space:]' < UPSTREAM_VERSION)
-          IFS=. read -r major minor patch <<< "$v"
+          base=$(echo "$v" | sed -E 's/(alpha|beta|rc).*$//')
+          IFS=. read -r major minor patch <<< "$base"
           echo "ZBX_VERSION=$v" >> "$GITHUB_ENV"
+          echo "ZBX_MSI_VERSION=$base" >> "$GITHUB_ENV"
           echo "ZBX_NEXT_VERSION=$major.$minor.$((patch + 1))" >> "$GITHUB_ENV"
 
       - name: Restore third-party libraries
@@ -399,7 +403,7 @@ jobs:
             -ext WixToolset.Util.wixext ^
             -ext WixToolset.UI.wixext ^
             -arch x64 ^
-            -d Version=%ZBX_VERSION% ^
+            -d Version=%ZBX_MSI_VERSION% ^
             -d BinDir=..\..\..\bin\win64 ^
             -d ConfDir=..\..\..\conf ^
             -o ..\..\..\bin\win64\zabbix_proxy-%ZBX_VERSION%-x64.msi
@@ -558,6 +562,7 @@ jobs:
           cd dist
           msi="zabbix_proxy-${ZBX_VERSION}-x64.msi"
           sha256sum "$msi" > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" "$msi" SHA256SUMS \
+          pre=""; case "$ZBX_VERSION" in *alpha*|*beta*|*rc*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" "$msi" SHA256SUMS $pre \
             --title "Zabbix proxy $ZBX_VERSION for Windows (${GITHUB_REF_NAME#v})" \
             --notes "Community build of the Zabbix $ZBX_VERSION proxy for Windows x64. Unsigned; check the SHA-256 against SHA256SUMS. Not affiliated with Zabbix SIA. Source: the $GITHUB_REF_NAME tag of this repository plus Zabbix $ZBX_VERSION."
