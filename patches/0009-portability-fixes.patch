@@ -3,6 +3,17 @@ Portability: small MSVC / Windows fixes across shared code
 Name resolution, large configuration receive, rand(), DLL modules,
 ODBC, WMI, vault and VMware counters.
 
+diff --git a/include/zbxcompress.h b/include/zbxcompress.h
+index 12d08c51759827be59953dcc8d7f6842fb38e678..b26759215d0a10603a417ed0bd265da71b60a379 100644
+--- a/include/zbxcompress.h
++++ b/include/zbxcompress.h
+@@ -20,5 +20,6 @@
+ int	zbx_compress(const char *in, size_t size_in, char **out, size_t *size_out);
+ int	zbx_uncompress(const char *in, size_t size_in, char *out, size_t *size_out);
+ const char	*zbx_compress_strerror(void);
++size_t	zbx_compress_max_size(void);
+ 
+ #endif
 diff --git a/src/libs/zbxcfg/cfg.c b/src/libs/zbxcfg/cfg.c
 index 874dd33d64b2510d7fd57c173d07c6ad70c7da37..86433a1d3d8d2885a11df4189d8eaa4a716cc0d3 100644
 --- a/src/libs/zbxcfg/cfg.c
@@ -20,7 +31,7 @@ index 874dd33d64b2510d7fd57c173d07c6ad70c7da37..86433a1d3d8d2885a11df4189d8eaa4a
  #include <libgen.h>
  #endif
 diff --git a/src/libs/zbxcomms/comms.c b/src/libs/zbxcomms/comms.c
-index 399ec29453ed0662cc235064d5006dee22987123..0be03c5fc9a1d6a1df95542e44c2e62cca540e7a 100644
+index 399ec29453ed0662cc235064d5006dee22987123..6c161709b098ffc9af630d7a6d1d16341bd515ea 100644
 --- a/src/libs/zbxcomms/comms.c
 +++ b/src/libs/zbxcomms/comms.c
 @@ -181,7 +181,7 @@ static int	zbx_socket_peer_ip_save(zbx_socket_t *s)
@@ -63,6 +74,137 @@ index 399ec29453ed0662cc235064d5006dee22987123..0be03c5fc9a1d6a1df95542e44c2e62c
  	zbx_socket_free(s);
  	tcp_recv_context->allocated = 0;
  
+@@ -2244,6 +2238,17 @@ ssize_t	zbx_tcp_recv_context(zbx_socket_t *s, zbx_tcp_recv_context_t *context, u
+ 				goto out;
+ 			}
+ 
++			if (zbx_compress_max_size() < context->reserved)
++			{
++				zbx_set_socket_strerror("uncompressed message size exceeds what this platform can uncompress");
++				zabbix_log(LOG_LEVEL_WARNING, "Uncompressed message size " ZBX_FS_UI64 " from %s"
++						" exceeds the " ZBX_FS_UI64 " bytes zlib addresses on this platform."
++						" Message ignored.", context->reserved, s->peer,
++						(zbx_uint64_t)zbx_compress_max_size());
++				nbytes = ZBX_PROTO_ERROR;
++				goto out;
++			}
++
+ 			if (sizeof(s->buf_stat) > context->expected_len)
+ 			{
+ 				context->buf_stat_bytes -= context->offset;
+diff --git a/src/libs/zbxcomms/comms.h b/src/libs/zbxcomms/comms.h
+index 34ef178fcf09034786781b08d5f7cd0c5c82606f..5b56da9c48096590373a0c79f975e0a99324793b 100644
+--- a/src/libs/zbxcomms/comms.h
++++ b/src/libs/zbxcomms/comms.h
+@@ -21,12 +21,14 @@
+ #define ZBX_SOCKET_POLL_TIMEOUT	1000
+ 
+ #ifdef _WINDOWS
+-#	define ZBX_TCP_WRITE(s, b, bl)		((ssize_t)send((s), (b), (int)(bl), 0))
+-#	define ZBX_TCP_READ(s, b, bl)		((ssize_t)recv((s), (b), (int)(bl), 0))
+-#	define ZBX_TCP_RECV(s, b, bl, f)		((ssize_t)recv((s), (b), (int)(bl), f))
++/* winsock takes int lengths; a longer buffer goes out in several calls, the callers loop on the count sent */
++#	define ZBX_SOCKET_LEN(bl)		((size_t)(bl) > (size_t)INT_MAX ? INT_MAX : (int)(bl))
++#	define ZBX_TCP_WRITE(s, b, bl)		((ssize_t)send((s), (b), ZBX_SOCKET_LEN(bl), 0))
++#	define ZBX_TCP_READ(s, b, bl)		((ssize_t)recv((s), (b), ZBX_SOCKET_LEN(bl), 0))
++#	define ZBX_TCP_RECV(s, b, bl, f)		((ssize_t)recv((s), (b), ZBX_SOCKET_LEN(bl), f))
+ #	define zbx_socket_close(s)		if (ZBX_SOCKET_ERROR != (s)) closesocket(s)
+ #	define zbx_bind(s, a, l)		(bind((s), (a), (int)(l)))
+-#	define zbx_sendto(fd, b, n, f, a, l)	(sendto((fd), (b), (int)(n), (f), (a), (l)))
++#	define zbx_sendto(fd, b, n, f, a, l)	(sendto((fd), (b), ZBX_SOCKET_LEN(n), (f), (a), (l)))
+ #	define ZBX_PROTO_AGAIN			WSAEINTR
+ #	define ZBX_SOCKET_ERROR			INVALID_SOCKET
+ #else
+diff --git a/src/libs/zbxcomms/tls_openssl.c b/src/libs/zbxcomms/tls_openssl.c
+index f03e1b238c25261269e605e26d3f9364da6893ea..664f5f040107a5df27a4db15d571319de14d7ad2 100644
+--- a/src/libs/zbxcomms/tls_openssl.c
++++ b/src/libs/zbxcomms/tls_openssl.c
+@@ -2098,7 +2098,8 @@ ssize_t	zbx_tls_write(zbx_socket_t *s, const char *buf, size_t len, short *event
+ 
+ 	while (1)
+ 	{
+-		if (0 == (n = SSL_write(s->tls_ctx->ctx, buf + offset, (int)(len - (size_t)offset))))
++		if (0 == (n = SSL_write(s->tls_ctx->ctx, buf + offset,
++				len - (size_t)offset > (size_t)INT_MAX ? INT_MAX : (int)(len - (size_t)offset))))
+ 			break;
+ 
+ 		if (0 > n)
+diff --git a/src/libs/zbxcompress/compress.c b/src/libs/zbxcompress/compress.c
+index bf58b6054d98a7474cd05de67bfd540de183a352..03f4a79d3bda296246bad6eab24148ee1e732bc8 100644
+--- a/src/libs/zbxcompress/compress.c
++++ b/src/libs/zbxcompress/compress.c
+@@ -23,6 +23,9 @@
+ 
+ static int	zbx_zlib_errno = 0;
+ 
++/* zlib sizes are uLong, 32 bits on 64-bit Windows; this stands for a size it cannot address */
++#define ZBX_ZLIB_ESIZE	1
++
+ /******************************************************************************
+  *                                                                            *
+  * Purpose: returns last conversion error message                             *
+@@ -46,6 +49,9 @@ const char	*zbx_compress_strerror(void)
+ 		case Z_DATA_ERROR:
+ 			zbx_strlcpy(message, "corrupted input data", sizeof(message));
+ 			break;
++		case ZBX_ZLIB_ESIZE:
++			zbx_strlcpy(message, "data size exceeds what zlib addresses on this platform", sizeof(message));
++			break;
+ 		default:
+ 			zbx_snprintf(message, sizeof(message), "unknown error (%d)", zbx_zlib_errno);
+ 			break;
+@@ -75,6 +81,12 @@ int	zbx_compress(const char *in, size_t size_in, char **out, size_t *size_out)
+ 	Bytef	*buf;
+ 	uLongf	buf_size;
+ 
++	if (zbx_compress_max_size() < size_in)
++	{
++		zbx_zlib_errno = ZBX_ZLIB_ESIZE;
++		return FAIL;
++	}
++
+ 	buf_size = compressBound(size_in);
+ 	buf = (Bytef *)zbx_malloc(NULL, buf_size);
+ 
+@@ -105,7 +117,15 @@ int	zbx_compress(const char *in, size_t size_in, char **out, size_t *size_out)
+  ******************************************************************************/
+ int	zbx_uncompress(const char *in, size_t size_in, char *out, size_t *size_out)
+ {
+-	uLongf	size_o = *size_out;
++	uLongf	size_o;
++
++	if (zbx_compress_max_size() < size_in || zbx_compress_max_size() < *size_out)
++	{
++		zbx_zlib_errno = ZBX_ZLIB_ESIZE;
++		return FAIL;
++	}
++
++	size_o = (uLongf)*size_out;
+ 
+ 	if (Z_OK != (zbx_zlib_errno = uncompress((Bytef *)out, &size_o, (const Bytef *)in, size_in)))
+ 		return FAIL;
+@@ -141,3 +161,21 @@ const char	*zbx_compress_strerror(void)
+ }
+ 
+ #endif
++
++/******************************************************************************
++ *                                                                            *
++ * Purpose: returns the largest data size zlib can address on this platform   *
++ *                                                                            *
++ * Comments: zlib measures data in uLong, 32 bits on 64-bit Windows, while    *
++ *           the protocol limits are size_t; callers check a size against     *
++ *           this before allocating for it.                                   *
++ *                                                                            *
++ ******************************************************************************/
++size_t	zbx_compress_max_size(void)
++{
++#ifdef HAVE_ZLIB
++	return (size_t)(~(uLong)0);
++#else
++	return (size_t)-1;
++#endif
++}
 diff --git a/src/libs/zbxeval/execute.c b/src/libs/zbxeval/execute.c
 index 98dbda8d72cdfb0df0ae37d7ef6f2609bc57ef9d..ec8690730a7b646a2b936b38b92817026c2431cc 100644
 --- a/src/libs/zbxeval/execute.c

@@ -384,6 +384,15 @@ almost nothing after start-up, so silence is good news.
     Validation reports every problem it finds, not just the first. Read the
     whole output.
 
+  Uncompressed message size <n> from <server> exceeds the 4294967295 bytes
+  zlib addresses on this platform. Message ignored.
+
+    The server sent a compressed message, usually the configuration, whose
+    uncompressed size is beyond what zlib can address on Windows, where its
+    sizes are 32-bit. The proxy refuses it before allocating for it instead of
+    truncating. A configuration that large means far too many hosts on one
+    proxy; split them over several proxies.
+
 
 Upgrading
 ---------
