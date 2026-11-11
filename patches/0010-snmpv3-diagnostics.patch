@@ -1,0 +1,160 @@
+diff --git a/src/libs/zbxpoller/checks_snmp.c b/src/libs/zbxpoller/checks_snmp.c
+index 34ecb3b..d602d07 100644
+--- a/src/libs/zbxpoller/checks_snmp.c
++++ b/src/libs/zbxpoller/checks_snmp.c
+@@ -791,8 +791,65 @@ end:
+ 	zabbix_log(LOG_LEVEL_DEBUG, "End of %s()", __func__);
+ }
+ 
++/* SYNC WITH PHP! */
++static const char	*zbx_snmpv3_auth_protocol_name(unsigned char authprotocol)
++{
++	switch (authprotocol)
++	{
++		case 0: return "MD5";
++		case 1: return "SHA1";
++		case 2: return "SHA224";
++		case 3: return "SHA256";
++		case 4: return "SHA384";
++		case 5: return "SHA512";
++		default: return "unknown";
++	}
++}
++
++static const char	*zbx_snmpv3_priv_protocol_name(unsigned char privprotocol)
++{
++	switch (privprotocol)
++	{
++		case 0: return "DES";
++		case 1: return "AES128";
++		case 2: return "AES192";
++		case 3: return "AES256";
++		case 4: return "AES192C";
++		case 5: return "AES256C";
++		default: return "unknown";
++	}
++}
++
++#ifdef HAVE_NETSNMP_STRONG_AUTH
++#	define ZBX_SNMPV3_STRONG_AUTH_HINT ""
++#else
++#	define ZBX_SNMPV3_STRONG_AUTH_HINT " (SHA-2 auth support is not compiled in: HAVE_NETSNMP_STRONG_AUTH undefined)"
++#endif
++
++#ifdef HAVE_NETSNMP_STRONG_PRIV
++#	define ZBX_SNMPV3_STRONG_PRIV_HINT ""
++#else
++#	define ZBX_SNMPV3_STRONG_PRIV_HINT " (AES192/256 support is not compiled in: HAVE_NETSNMP_STRONG_PRIV undefined)"
++#endif
++
+ static int	zbx_snmpv3_set_auth_protocol(unsigned char snmpv3_authprotocol, struct snmp_session *session)
+ {
++	static int	strong_auth_reported = 0;
++
++	if (0 == strong_auth_reported)
++	{
++		strong_auth_reported = 1;
++#ifdef HAVE_NETSNMP_STRONG_AUTH
++		zabbix_log(LOG_LEVEL_DEBUG, "SNMPv3 strong SHA-2 auth protocols are compiled in");
++#else
++		zabbix_log(LOG_LEVEL_WARNING, "SNMPv3 strong SHA-2 auth protocols are NOT compiled in"
++				" (HAVE_NETSNMP_STRONG_AUTH undefined); auth protocols 2-5 will be rejected");
++#endif
++	}
++
++	zabbix_log(LOG_LEVEL_DEBUG, "SNMPv3 auth protocol: %u (%s)", (unsigned int)snmpv3_authprotocol,
++			zbx_snmpv3_auth_protocol_name(snmpv3_authprotocol));
++
+ /* item snmpv3 authentication protocol */
+ /* SYNC WITH PHP!                      */
+ #define ITEM_SNMPV3_AUTHPROTOCOL_MD5		0
+@@ -832,6 +889,10 @@ static int	zbx_snmpv3_set_auth_protocol(unsigned char snmpv3_authprotocol, struc
+ 			break;
+ #endif
+ 		default:
++			zabbix_log(LOG_LEVEL_WARNING, "unsupported SNMPv3 authentication protocol: %u (%s)%s",
++					(unsigned int)snmpv3_authprotocol,
++					zbx_snmpv3_auth_protocol_name(snmpv3_authprotocol),
++					ZBX_SNMPV3_STRONG_AUTH_HINT);
+ 			ret = FAIL;
+ 	}
+ 
+@@ -933,7 +994,12 @@ static zbx_snmp_sess_t	zbx_snmp_open_session(unsigned char snmp_version, const c
+ 	zbx_snmp_sess_t		ssp = NULL;
+ 	char			addr[128];
+ 
+-	zabbix_log(LOG_LEVEL_DEBUG, "In %s() itemid:" ZBX_FS_UI64 ", version:%d", __func__, itemid, snmp_version);
++	zabbix_log(LOG_LEVEL_DEBUG, "In %s() itemid:" ZBX_FS_UI64 ", version:%d, securityname:'%s',"
++			" securitylevel:%u, authprotocol:%u (%s), privprotocol:%u (%s)", __func__, itemid,
++			snmp_version, (NULL != snmpv3_securityname ? snmpv3_securityname : ""),
++			(unsigned int)snmpv3_securitylevel, (unsigned int)snmpv3_authprotocol,
++			zbx_snmpv3_auth_protocol_name(snmpv3_authprotocol), (unsigned int)snmpv3_privprotocol,
++			zbx_snmpv3_priv_protocol_name(snmpv3_privprotocol));
+ 
+ 	snmp_sess_init(&session);
+ 
+@@ -1004,8 +1070,10 @@ static zbx_snmp_sess_t	zbx_snmp_open_session(unsigned char snmp_version, const c
+ 
+ 				if (FAIL == zbx_snmpv3_set_auth_protocol(snmpv3_authprotocol, &session))
+ 				{
+-					zbx_snprintf(error, max_error_len, "Unsupported authentication protocol [%d]",
+-							snmpv3_authprotocol);
++					zbx_snprintf(error, max_error_len, "Unsupported authentication protocol [%d] (%s)%s",
++							snmpv3_authprotocol,
++							zbx_snmpv3_auth_protocol_name(snmpv3_authprotocol),
++							ZBX_SNMPV3_STRONG_AUTH_HINT);
+ 					goto end;
+ 				}
+ 
+@@ -1026,8 +1094,10 @@ static zbx_snmp_sess_t	zbx_snmp_open_session(unsigned char snmp_version, const c
+ 
+ 				if (FAIL == zbx_snmpv3_set_auth_protocol(snmpv3_authprotocol, &session))
+ 				{
+-					zbx_snprintf(error, max_error_len, "Unsupported authentication protocol [%d]",
+-							snmpv3_authprotocol);
++					zbx_snprintf(error, max_error_len, "Unsupported authentication protocol [%d] (%s)%s",
++							snmpv3_authprotocol,
++							zbx_snmpv3_auth_protocol_name(snmpv3_authprotocol),
++							ZBX_SNMPV3_STRONG_AUTH_HINT);
+ 					goto end;
+ 				}
+ 
+@@ -1081,8 +1151,10 @@ static zbx_snmp_sess_t	zbx_snmp_open_session(unsigned char snmp_version, const c
+ #endif
+ 					default:
+ 						zbx_snprintf(error, max_error_len,
+-								"Unsupported privacy protocol [%d]",
+-								snmpv3_privprotocol);
++								"Unsupported privacy protocol [%d] (%s)%s",
++								snmpv3_privprotocol,
++								zbx_snmpv3_priv_protocol_name(snmpv3_privprotocol),
++								ZBX_SNMPV3_STRONG_PRIV_HINT);
+ 						goto end;
+ 				}
+ 
+@@ -1129,7 +1201,15 @@ static zbx_snmp_sess_t	zbx_snmp_open_session(unsigned char snmp_version, const c
+ 		zbx_strlcpy(error, "Cannot open SNMP session", max_error_len);
+ 	}
+ end:
+-	zabbix_log(LOG_LEVEL_DEBUG, "End of %s() itemid:" ZBX_FS_UI64, __func__, itemid);
++	if (NULL == ssp)
++	{
++		zabbix_log(LOG_LEVEL_DEBUG, "End of %s() itemid:" ZBX_FS_UI64 " failed: %s", __func__, itemid,
++				('\0' != *error ? error : "unknown error"));
++	}
++	else
++	{
++		zabbix_log(LOG_LEVEL_DEBUG, "End of %s() itemid:" ZBX_FS_UI64, __func__, itemid);
++	}
+ 
+ 	return ssp;
+ #undef ITEM_SNMPV3_PRIVPROTOCOL_DES
+@@ -3469,7 +3549,7 @@ static int	async_task_process_task_snmp_cb(short event, void *data, int *fd, zbx
+ 		{
+ 			snmp_context->item.ret = NOTSUPPORTED;
+ 			SET_MSG_RESULT(&snmp_context->item.result, zbx_dsprintf(NULL,
+-					"zbx_snmp_open_session() failed"));
++					"zbx_snmp_open_session() failed: %s", ('\0' != *error ? error : "unknown error")));
+ 			goto stop;
+ 		}
+ 	}

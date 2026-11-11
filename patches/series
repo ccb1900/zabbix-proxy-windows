@@ -7,3 +7,4 @@
 0007-snmp-ssh.patch
 0008-sqlite-wal.patch
 0009-portability-fixes.patch
+0010-snmpv3-diagnostics.patch
