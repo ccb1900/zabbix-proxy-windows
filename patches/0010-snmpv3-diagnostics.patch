@@ -1,3 +1,12 @@
+SNMPv3 diagnostics and clearer session errors
+
+Keep the error produced by zbx_snmp_open_session instead of replacing it
+with a bare zbx_snmp_open_session() failed. Log the security name, security
+level and auth/priv protocols when a session is opened, include protocol
+names in the unsupported-protocol messages, and add an explicit hint when
+HAVE_NETSNMP_STRONG_AUTH or HAVE_NETSNMP_STRONG_PRIV was not defined at
+build time.
+
 diff --git a/src/libs/zbxpoller/checks_snmp.c b/src/libs/zbxpoller/checks_snmp.c
 index 34ecb3b..d602d07 100644
 --- a/src/libs/zbxpoller/checks_snmp.c
